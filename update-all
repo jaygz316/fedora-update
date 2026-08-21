@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+#
+# update: Standalone system update utility
+# Location: ~/.local/bin/update
+#
+
+set -u
+
+# Ensure PATH includes all user toolchains and binaries
+for dir in \
+    "$HOME/.local/bin" \
+    "$HOME/bin" \
+    "$HOME/.cargo/bin" \
+    "$HOME/.bun/bin" \
+    "$HOME/.npm-global/bin" \
+    "$HOME/.lmstudio/bin" \
+    "$HOME/google-cloud-sdk/bin" \
+    "$HOME/go/bin"
+do
+    if [ -d "$dir" ] && [[ ":$PATH:" != *":$dir:"* ]]; then
+        PATH="$dir:$PATH"
+    fi
+done
+export PATH
+
+# Persistent logging configuration
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update"
+mkdir -p "$LOG_DIR"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="$LOG_DIR/update_${TIMESTAMP}.log"
+LAST_LOG="$LOG_DIR/last-update.log"
+
+# Clean up older log files (keep last 10)
+find "$LOG_DIR" -name "update_*.log" -type f 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
+
+# Redirect output to both terminal and log file
+exec > >(tee -a "$LOG_FILE" | tee "$LAST_LOG") 2>&1
+
+# Formatting & Colors
+BOLD="\033[1m"
+GREEN="\033[0;32m"
+YELLOW="\033[0;33m"
+RED="\033[0;31m"
+CYAN="\033[0;36m"
+RESET="\033[0m"
+
+START_TIME=$(date +%s)
+
+echo -e "${BOLD}${CYAN}==========================================${RESET}"
+echo -e "${BOLD}${CYAN}          Starting System Update          ${RESET}"
+echo -e "${BOLD}${CYAN}  Log: $LOG_FILE${RESET}"
+echo -e "${BOLD}${CYAN}==========================================${RESET}\n"
+
+# Sudo credentials keepalive (prompts once upfront if needed)
+if command -v sudo &>/dev/null; then
+    if sudo -v 2>/dev/null; then
+        while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+        SUDO_PID=$!
+        trap 'kill "$SUDO_PID" 2>/dev/null || true' EXIT
+    fi
+fi
+
+# Step counter helper
+STEP_COUNT=0
+TOTAL_STEPS=24
+
+step() {
+    ((STEP_COUNT++))
+    echo -e "\n${BOLD}${GREEN}[+] ${STEP_COUNT}/${TOTAL_STEPS} $1...${RESET}"
+}
+
+skip_step() {
+    ((STEP_COUNT++))
+    echo -e "\n${YELLOW}[-] ${STEP_COUNT}/${TOTAL_STEPS} $1 (not found, skipping)${RESET}"
+}
+
+# Helper function to update git repositories safely with version check
+_update_git_repo() {
+    local repo_path="$1"
+    local repo_name
+    repo_name="$(basename "$repo_path")"
+    if [ -d "$repo_path" ]; then
+        (
+            cd "$repo_path" || return 1
+            if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+                git fetch --quiet --all --prune
+                local local_commit upstream_commit
+                local_commit="$(git rev-parse HEAD 2>/dev/null)"
+                upstream_commit="$(git rev-parse '@{u}' 2>/dev/null)"
+                if [ -n "$local_commit" ] && [ "$local_commit" = "$upstream_commit" ]; then
+                    echo -e "  ${GREEN}[OK] $repo_name is already up to date.${RESET}"
+                else
+                    echo -e "  ${BOLD}[*] Pulling latest changes for $repo_name...${RESET}"
+                    git pull --rebase --autostash
+                fi
+            else
+                echo -e "  ${YELLOW}^ WARNING: $repo_path is not a valid Git repository.${RESET}"
+                return 1
+            fi
+        ) || echo -e "  ${YELLOW}^ WARNING: Failed to update git repo at $repo_path${RESET}"
+    else
+        echo -e "  ${YELLOW}^ WARNING: Directory $repo_path does not exist.${RESET}"
+    fi
+}
+
+# Helper function to update Go tools only if upstream module version differs
+_update_go_tool() {
+    local bin_name="$1"
+    local install_path="$2"
+    local bin_path="$HOME/go/bin/$bin_name"
+
+    if [ -x "$bin_path" ]; then
+        local mod_line mod_path current_ver latest_ver
+        mod_line="$(go version -m "$bin_path" 2>/dev/null | grep -E "^\s*mod\s+" | head -n 1)"
+        mod_path="$(echo "$mod_line" | awk '{print $2}')"
+        current_ver="$(echo "$mod_line" | awk '{print $3}')"
+
+        if [ -n "$mod_path" ]; then
+            latest_ver="$(curl -s --max-time 3 "https://proxy.golang.org/$mod_path/@latest" 2>/dev/null | grep -o '"Version":"[^"]*"' | cut -d'"' -f4)"
+        fi
+
+        if [ -n "$current_ver" ] && [ -n "$latest_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
+            echo -e "  ${GREEN}[OK] $bin_name is already up to date ($current_ver).${RESET}"
+            return 0
+        fi
+    fi
+
+    echo -e "  ${BOLD}[*] Updating $bin_name ($install_path)...${RESET}"
+    go install "$install_path@latest"
+}
+
+# 1. DNF Packages
+step "Refreshing and upgrading DNF packages"
+sudo dnf upgrade --refresh -y || echo -e "  ${RED}^ WARNING: DNF upgrade failed, continuing...${RESET}"
+sudo dnf autoremove -y || echo -e "  ${RED}^ WARNING: DNF autoremove failed, continuing...${RESET}"
+sudo dnf clean packages -y >/dev/null 2>&1 || true
+
+# 2. Flatpaks
+if command -v flatpak &> /dev/null; then
+    step "Updating Flatpaks and cleaning unused runtimes"
+    flatpak update -y || flatpak update --no-static-deltas -y || echo -e "  ${RED}^ WARNING: Flatpak update failed, continuing...${RESET}"
+    flatpak uninstall --unused -y || echo -e "  ${RED}^ WARNING: Flatpak cleanup failed, continuing...${RESET}"
+else
+    skip_step "Flatpak CLI"
+fi
+
+# 3. System & Hardware Firmware (LVFS)
+if command -v fwupdmgr &> /dev/null; then
+    step "Checking system & hardware firmware updates (LVFS)"
+    fwupdmgr refresh --no-unreported-check >/dev/null 2>&1 || true
+    if fwupdmgr get-updates --no-unreported-check >/dev/null 2>&1; then
+        fwupdmgr get-updates --no-unreported-check
+    else
+        fwupd_status=$?
+        if [ "$fwupd_status" -eq 2 ]; then
+            echo -e "  ${GREEN}[OK] All device and system firmware is up to date.${RESET}"
+        else
+            echo -e "  ${YELLOW}^ WARNING: Firmware check failed with status $fwupd_status, continuing...${RESET}"
+        fi
+    fi
+else
+    skip_step "'fwupdmgr'"
+fi
+
+# 4. Google Cloud SDK
+if [ -d "$HOME/google-cloud-sdk" ] && command -v gcloud &> /dev/null; then
+    step "Updating Google Cloud SDK components"
+    gcloud components update --quiet || echo -e "  ${RED}^ WARNING: Google Cloud SDK update failed, continuing...${RESET}"
+else
+    skip_step "Google Cloud SDK"
+fi
+
+# 5. Android SDK
+if command -v android &> /dev/null; then
+    step "Updating Android SDK"
+    android update || echo -e "  ${RED}^ WARNING: Android SDK update failed, continuing...${RESET}"
+else
+    skip_step "Android SDK CLI tool ('android')"
+fi
+
+# 6. Agy CLI
+if command -v agy &> /dev/null; then
+    step "Updating Agy CLI"
+    agy update || echo -e "  ${RED}^ WARNING: Agy update failed, continuing...${RESET}"
+else
+    skip_step "'agy' command"
+fi
+
+# 7. Claude Code CLI
+if command -v claude &> /dev/null; then
+    step "Updating Claude Code CLI"
+    claude update || echo -e "  ${RED}^ WARNING: Claude CLI update failed, continuing...${RESET}"
+else
+    skip_step "'claude' command"
+fi
+
+# 8. Herdr CLI
+if command -v herdr &> /dev/null; then
+    step "Checking Herdr CLI updates"
+    current_herdr="$(herdr --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+    latest_herdr="$(curl -s --max-time 3 "https://herdr.dev/latest.json" 2>/dev/null | grep -m1 '"version":' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+    if [ -n "$current_herdr" ] && [ -n "$latest_herdr" ] && [ "$current_herdr" = "$latest_herdr" ]; then
+        echo -e "  ${GREEN}[OK] Herdr is already up to date ($current_herdr).${RESET}"
+    else
+        echo -e "  ${BOLD}[*] Updating Herdr to latest version...${RESET}"
+        herdr update || echo -e "  ${RED}^ WARNING: Herdr update failed, continuing...${RESET}"
+    fi
+else
+    skip_step "'herdr' command"
+fi
+
+# 9. LM Studio Engines & Runtime
+if command -v lms &> /dev/null; then
+    step "Updating LM Studio runtime extensions"
+    lms runtime update -y --all || echo -e "  ${RED}^ WARNING: LM Studio runtime update failed, continuing...${RESET}"
+else
+    skip_step "'lms' command"
+fi
+
+# 10. Ollama
+if command -v ollama &> /dev/null; then
+    step "Checking Ollama updates"
+    current_ollama="$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+    latest_ollama="$(curl -s --max-time 3 "https://api.github.com/repos/ollama/ollama/releases/latest" 2>/dev/null | grep -m1 '"tag_name":' | sed -E 's/.*"v?([0-9.]+).*/\1/' || true)"
+    if [ -n "$current_ollama" ] && [ -n "$latest_ollama" ] && [ "$current_ollama" = "$latest_ollama" ]; then
+        echo -e "  ${GREEN}[OK] Ollama is already up to date ($current_ollama).${RESET}"
+    else
+        echo -e "  ${BOLD}[*] Upgrading Ollama (${current_ollama:-unknown} -> ${latest_ollama:-latest})...${RESET}"
+        curl -fsSL https://ollama.com/install.sh | sh || echo -e "  ${RED}^ WARNING: Ollama update failed, continuing...${RESET}"
+    fi
+else
+    skip_step "'ollama' command"
+fi
+
+# 11. Rust Toolchain (rustup)
+if command -v rustup &> /dev/null; then
+    step "Updating Rust toolchain (rustup)"
+    rustup update || echo -e "  ${RED}^ WARNING: rustup update failed, continuing...${RESET}"
+else
+    skip_step "'rustup' command"
+fi
+
+# 12. Astral uv
+if command -v uv &> /dev/null; then
+    step "Updating Astral uv & tools"
+    uv self update || echo -e "  ${RED}^ WARNING: uv self update failed, continuing...${RESET}"
+    uv tool upgrade --all || echo -e "  ${RED}^ WARNING: uv tool upgrade failed, continuing...${RESET}"
+else
+    skip_step "'uv' command"
+fi
+
+# 13. Bun Runtime
+if command -v bun &> /dev/null; then
+    step "Updating Bun runtime"
+    bun upgrade || echo -e "  ${RED}^ WARNING: Bun upgrade failed, continuing...${RESET}"
+else
+    skip_step "'bun' command"
+fi
+
+# 14. Global NPM Packages (Gemini CLI, Claude, etc.)
+if command -v npm &> /dev/null; then
+    step "Updating global NPM packages"
+    npm update -g || echo -e "  ${RED}^ WARNING: npm global update failed, continuing...${RESET}"
+else
+    skip_step "'npm' command"
+fi
+
+# 15. SDKMAN!
+if [ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
+    step "Updating SDKMAN! & candidates"
+    (
+        set +u
+        # shellcheck disable=SC1091
+        source "$HOME/.sdkman/bin/sdkman-init.sh"
+        sdk selfupdate force >/dev/null 2>&1 || true
+        sdk update
+    ) || echo -e "  ${RED}^ WARNING: SDKMAN update failed, continuing...${RESET}"
+else
+    skip_step "SDKMAN!"
+fi
+
+# 16. Go Binaries & Tooling
+if command -v go &> /dev/null; then
+    step "Updating Go binaries & tooling"
+    _update_go_tool "gopls" "golang.org/x/tools/gopls" || echo -e "  ${YELLOW}^ WARNING: gopls update failed.${RESET}"
+    _update_go_tool "dlv" "github.com/go-delve/delve/cmd/dlv" || echo -e "  ${YELLOW}^ WARNING: dlv update failed.${RESET}"
+else
+    skip_step "'go' command"
+fi
+
+# 17. Python, Pip & User CLI Utilities
+if command -v python3 &> /dev/null; then
+    step "Updating Python, pip, and user CLI packages"
+    echo -e "  ${BOLD}[*] Upgrading pip...${RESET}"
+    python3 -m pip install --user --upgrade pip --quiet || echo -e "  ${YELLOW}^ WARNING: pip self-upgrade failed.${RESET}"
+    
+    echo -e "  ${BOLD}[*] Upgrading user Python CLI utilities & core packages...${RESET}"
+    python3 -m pip install --user --upgrade \
+        esptool \
+        meshtastic \
+        openai-whisper \
+        google-antigravity \
+        google-genai \
+        mcp \
+        rich-click \
+        tabulate \
+        pyinstaller \
+        uvicorn \
+        websockets \
+        setuptools \
+        --quiet || echo -e "  ${RED}^ WARNING: Python packages update failed, continuing...${RESET}"
+else
+    skip_step "'python3' command"
+fi
+
+# 18. VS Code Extensions
+if command -v code &> /dev/null; then
+    step "Updating Visual Studio Code extensions"
+    code --update-extensions --force >/dev/null 2>&1 || echo -e "  ${YELLOW}^ WARNING: VS Code extension update failed, continuing...${RESET}"
+else
+    skip_step "Visual Studio Code ('code')"
+fi
+
+# 19. Micro Editor Plugins
+if command -v micro &> /dev/null; then
+    step "Updating Micro editor plugins"
+    micro -plugin update 2>/dev/null || echo -e "  ${YELLOW}^ WARNING: Micro plugins update failed, continuing...${RESET}"
+else
+    skip_step "Micro editor ('micro')"
+fi
+
+# 20. Agent Skills & Configurations
+if [ -f "$HOME/.agents/.skill-lock.json" ] && command -v npx &> /dev/null; then
+    step "Updating agent skills"
+    npx -y skills update --yes 2>/dev/null || echo -e "  ${YELLOW}^ WARNING: Agent skills update failed, continuing...${RESET}"
+else
+    skip_step "Agent Skills lockfile"
+fi
+
+# 21. GitHub CLI Extensions
+if command -v gh &> /dev/null; then
+    if gh auth status &>/dev/null; then
+        step "Updating GitHub CLI extensions"
+        gh extension upgrade --all || echo -e "  ${RED}^ WARNING: GitHub CLI extensions update failed, continuing...${RESET}"
+    else
+        skip_step "GitHub CLI (not authenticated, run 'gh auth login')"
+    fi
+else
+    skip_step "'gh' command"
+fi
+
+# 22. Local Git Repositories & Agent Frameworks
+step "Updating local Git repositories & documentation"
+_update_git_repo "$HOME/.hermes/hermes-agent"
+# Keep Hermes virtualenv dependencies synchronized if repo was updated
+if [ -d "$HOME/.hermes/hermes-agent/venv" ]; then
+    "$HOME/.hermes/hermes-agent/venv/bin/pip" install --upgrade -e "$HOME/.hermes/hermes-agent" --quiet 2>/dev/null || true
+fi
+_update_git_repo "$HOME/projects/docs/androidx"
+_update_git_repo "$HOME/projects/docs/compose-samples"
+_update_git_repo "$HOME/projects/docs/horologist"
+_update_git_repo "$HOME/projects/docs/nowinandroid"
+
+# 23. Docker Cleanup
+if command -v docker &> /dev/null && systemctl is-active --quiet docker 2>/dev/null; then
+    step "Pruning unused Docker dangling images"
+    docker image prune -f || echo -e "  ${YELLOW}^ WARNING: Docker image prune failed, continuing...${RESET}"
+else
+    skip_step "Docker service"
+fi
+
+# 24. System Journal & SSD Maintenance
+step "Optimizing system logs (journalctl) and trimming SSD (fstrim)"
+echo -e "  ${BOLD}[*] Vacuuming systemd journal logs (keeping 14 days / max 500MB)...${RESET}"
+sudo journalctl --vacuum-time=14d --vacuum-size=500M >/dev/null 2>&1 || echo -e "  ${YELLOW}^ WARNING: journalctl vacuuming failed, continuing...${RESET}"
+echo -e "  ${BOLD}[*] Performing SSD TRIM...${RESET}"
+sudo fstrim -av >/dev/null 2>&1 || echo -e "  ${YELLOW}^ WARNING: fstrim failed, continuing...${RESET}"
+echo -e "  ${GREEN}[OK] System logs vacuumed and SSD trimmed.${RESET}"
+
+# Post-Update Reboot & Service Checks
+echo -e "\n${BOLD}${CYAN}==========================================${RESET}"
+echo -e "${BOLD}${CYAN}   Checking for Required Service Restarts ${RESET}"
+echo -e "${BOLD}${CYAN}==========================================${RESET}"
+
+if command -v dnf &> /dev/null; then
+    # Check if a reboot is needed (kernel, glibc, systemd)
+    if sudo dnf needs-restarting -r >/dev/null 2>&1; then
+        echo -e "${GREEN}  [OK] No system reboot required.${RESET}"
+    else
+        echo -e "${YELLOW}  [!] A system reboot is RECOMMENDED (kernel or core libraries updated).${RESET}"
+    fi
+
+    # Check which background services need restarting
+    echo -e "${BOLD}  [*] Checking active services requiring restart:${RESET}"
+    sudo dnf needs-restarting -s 2>/dev/null | sed 's/^/      /' || true
+fi
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo -e "\n${BOLD}${GREEN}--- Update process complete in ${DURATION}s! ---${RESET}"
+echo -e "${CYAN}Full execution log saved to: ${LOG_FILE}${RESET}\n"
