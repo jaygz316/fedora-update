@@ -13,7 +13,7 @@ It unifies OS packages, Flatpaks, developer toolchains, AI runtimes, CLI utiliti
   - Updates Flatpaks with automatic fallback for Flathub delta decompression limits (`--no-static-deltas`) and prunes orphaned runtimes.
   - Checks hardware & system firmware via LVFS (`fwupdmgr`).
 - **Developer & AI Toolchains**:
-  - **AI Engines & CLI Agents**: Agy CLI (`agy`), Claude Code (`claude`), Herdr CLI (`herdr`), Ollama (`ollama`), and agent skills.
+  - **AI Engines & CLI Agents**: Google Antigravity Desktop & IDE, Agy CLI (`agy`), Claude Code (`claude`), Herdr CLI (`herdr`), Ollama runtime & models (`ollama`), and agent skills.
   - **Runtimes & Package Managers**: Astral `uv` & tools, `bun`, global `npm` packages, Go tooling (`gopls`, `dlv`), and user `pip` CLI tools.
   - **SDKs & Editors**: Android SDK (`android`), Visual Studio Code extensions, Micro editor plugins, and GitHub CLI extensions (`gh`).
 - **Documentation & Git Repositories**:

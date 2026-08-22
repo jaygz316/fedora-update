@@ -62,7 +62,7 @@ fi
 
 # Step counter helper
 STEP_COUNT=0
-TOTAL_STEPS=24
+TOTAL_STEPS=26
 
 step() {
     ((STEP_COUNT++))
@@ -186,7 +186,216 @@ else
     skip_step "'agy' command"
 fi
 
-# 7. Claude Code CLI
+# 7. Google Antigravity Desktop
+antigravity_dir="$HOME/.local/opt/antigravity"
+if [ -d "$antigravity_dir" ] || [ -f "$HOME/.local/bin/antigravity" ]; then
+    step "Checking Google Antigravity Desktop updates"
+    
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64)
+            arch_dir="linux-x64"
+            ;;
+        aarch64|arm64)
+            arch_dir="linux-arm"
+            ;;
+        *)
+            echo -e "  ${YELLOW}^ WARNING: Unsupported architecture: $arch${RESET}"
+            arch_dir=""
+            ;;
+    esac
+
+    if [ -n "$arch_dir" ]; then
+        manifest_url="https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-x64-linux.yml"
+        manifest_data="$(curl -s --max-time 5 "$manifest_url" 2>/dev/null || true)"
+        
+        current_antigravity=""
+        if [ -f "$antigravity_dir/.version" ]; then
+            current_antigravity="$(cat "$antigravity_dir/.version" 2>/dev/null || true)"
+        fi
+        if [ -z "$current_antigravity" ] && [ -f "$antigravity_dir/resources/app.asar" ] && command -v npx &>/dev/null; then
+            tmp_asar_dir="$(mktemp -d -t antigravity-asar-XXXXXX)"
+            current_antigravity="$( (cd "$tmp_asar_dir" && npx -y @electron/asar extract-file "$antigravity_dir/resources/app.asar" package.json >/dev/null 2>&1 && grep '"version"' package.json 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true) | head -n 1)"
+            rm -rf "$tmp_asar_dir"
+        fi
+
+        latest_antigravity="$(echo "$manifest_data" | grep -E '^version:' | awk '{print $2}' || true)"
+
+        if [ -n "$current_antigravity" ] && [ -n "$latest_antigravity" ] && [ "$current_antigravity" = "$latest_antigravity" ]; then
+            echo -e "  ${GREEN}[OK] Google Antigravity is already up to date ($current_antigravity).${RESET}"
+        elif [ -n "$manifest_data" ] && [ -n "$latest_antigravity" ]; then
+            echo -e "  ${BOLD}[*] Upgrading Google Antigravity (${current_antigravity:-unknown} -> $latest_antigravity)...${RESET}"
+            base_url="$(echo "$manifest_data" | grep -o 'https://storage.googleapis.com/antigravity-public/antigravity-hub/[^/]*' | head -n 1)"
+            download_url="${base_url}/${arch_dir}/Antigravity.tar.gz"
+
+            tmp_work_dir="$(mktemp -d -t antigravity-update-XXXXXX)"
+            tarball_tmp="${tmp_work_dir}/Antigravity.tar.gz"
+            extract_dir="${tmp_work_dir}/extract"
+            mkdir -p "$extract_dir"
+
+            echo -e "  ${BOLD}--> Downloading $download_url...${RESET}"
+            if curl -# -fSL -o "$tarball_tmp" "$download_url"; then
+                echo -e "  ${BOLD}--> Installing update...${RESET}"
+                tar -xzf "$tarball_tmp" -C "$extract_dir"
+                payload_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+                if [ -z "$payload_dir" ]; then
+                    payload_dir="$extract_dir"
+                fi
+
+                if [ -d "$payload_dir" ] && [ -f "$payload_dir/antigravity" ]; then
+                    rm -rf "$antigravity_dir"
+                    mkdir -p "$antigravity_dir"
+                    mv "$payload_dir"/* "$antigravity_dir/"
+                    chmod +x "$antigravity_dir/antigravity"
+                    echo "$latest_antigravity" > "$antigravity_dir/.version"
+
+                    if [ -f "$antigravity_dir/resources/app.asar" ] && command -v npx &>/dev/null; then
+                        (cd "$antigravity_dir" && npx -y @electron/asar extract-file resources/app.asar icon.png >/dev/null 2>&1) || true
+                    fi
+
+                    mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
+                    cat << DESKTOP > "$HOME/.local/share/applications/antigravity.desktop"
+[Desktop Entry]
+Name=Antigravity
+Exec=$antigravity_dir/antigravity --no-sandbox
+Icon=$antigravity_dir/icon.png
+Type=Application
+Terminal=false
+Categories=Development;IDE;
+DESKTOP
+                    cp "$HOME/.local/share/applications/antigravity.desktop" "$HOME/Desktop/" 2>/dev/null || true
+                    chmod +x "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
+
+                    cat << WRAPPER > "$HOME/.local/bin/antigravity"
+#!/bin/bash
+exec "$antigravity_dir/antigravity" --no-sandbox "\$@"
+WRAPPER
+                    chmod +x "$HOME/.local/bin/antigravity"
+
+                    echo -e "  ${GREEN}[OK] Google Antigravity successfully updated to $latest_antigravity.${RESET}"
+                else
+                    echo -e "  ${RED}^ WARNING: Extraction failed (Antigravity binary not found in archive).${RESET}"
+                fi
+            else
+                echo -e "  ${RED}^ WARNING: Failed to download Antigravity from $download_url${RESET}"
+            fi
+            rm -rf "$tmp_work_dir"
+        else
+            echo -e "  ${YELLOW}^ WARNING: Unable to fetch Antigravity update manifest, continuing...${RESET}"
+        fi
+    fi
+else
+    skip_step "Google Antigravity Desktop"
+fi
+
+# 8. Google Antigravity IDE
+antigravity_ide_dir="$HOME/.local/opt/antigravity-ide"
+if [ -d "$antigravity_ide_dir" ] || [ -f "$HOME/.local/bin/antigravity-ide" ]; then
+    step "Checking Google Antigravity IDE updates"
+    
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64)
+            arch_ep="linux-x64"
+            ;;
+        aarch64|arm64)
+            arch_ep="linux-arm64"
+            ;;
+        *)
+            echo -e "  ${YELLOW}^ WARNING: Unsupported architecture: $arch${RESET}"
+            arch_ep=""
+            ;;
+    esac
+
+    if [ -n "$arch_ep" ]; then
+        update_api="https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/api/update/${arch_ep}/stable/latest"
+        response="$(curl -s --max-time 5 "$update_api" 2>/dev/null || true)"
+        download_url="$(echo "$response" | grep -o '"url":"[^"]*"' | cut -d'"' -f4 || true)"
+        
+        current_ide=""
+        if [ -f "$antigravity_ide_dir/.version" ]; then
+            current_ide="$(cat "$antigravity_ide_dir/.version" 2>/dev/null || true)"
+        fi
+        if [ -z "$current_ide" ] && [ -f "$antigravity_ide_dir/resources/app/product.json" ]; then
+            current_ide="$(grep -oE '"ideVersion": "[^"]+"' "$antigravity_ide_dir/resources/app/product.json" 2>/dev/null | cut -d'"' -f4 || true)"
+        fi
+
+        latest_ide=""
+        if [ -n "$download_url" ]; then
+            latest_ide="$(echo "$download_url" | sed -E 's|.*/stable/([^/-]+).*|\1|')"
+        fi
+
+        if [ -n "$current_ide" ] && [ -n "$latest_ide" ] && [ "$current_ide" = "$latest_ide" ]; then
+            echo -e "  ${GREEN}[OK] Google Antigravity IDE is already up to date ($current_ide).${RESET}"
+        elif [ -n "$download_url" ] && [ -n "$latest_ide" ]; then
+            echo -e "  ${BOLD}[*] Upgrading Google Antigravity IDE (${current_ide:-unknown} -> $latest_ide)...${RESET}"
+            encoded_url="${download_url// /%20}"
+
+            tmp_work_dir="$(mktemp -d -t antigravity-ide-update-XXXXXX)"
+            tarball_tmp="${tmp_work_dir}/Antigravity-IDE.tar.gz"
+            extract_dir="${tmp_work_dir}/extract"
+            mkdir -p "$extract_dir"
+
+            echo -e "  ${BOLD}--> Downloading $download_url...${RESET}"
+            if curl -# -fSL -o "$tarball_tmp" "$encoded_url"; then
+                echo -e "  ${BOLD}--> Installing update...${RESET}"
+                tar -xzf "$tarball_tmp" -C "$extract_dir"
+                payload_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+                if [ -z "$payload_dir" ]; then
+                    payload_dir="$extract_dir"
+                fi
+
+                if [ -d "$payload_dir" ] && ([ -f "$payload_dir/antigravity-ide" ] || [ -f "$payload_dir/antigravity" ]); then
+                    rm -rf "$antigravity_ide_dir"
+                    mkdir -p "$antigravity_ide_dir"
+                    mv "$payload_dir"/* "$antigravity_ide_dir/"
+                    if [ -f "$antigravity_ide_dir/antigravity-ide" ]; then
+                        chmod +x "$antigravity_ide_dir/antigravity-ide"
+                    elif [ -f "$antigravity_ide_dir/antigravity" ]; then
+                        chmod +x "$antigravity_ide_dir/antigravity"
+                    fi
+                    echo "$latest_ide" > "$antigravity_ide_dir/.version"
+
+                    if [ -f "$antigravity_ide_dir/resources/app/resources/linux/code.png" ]; then
+                        cp "$antigravity_ide_dir/resources/app/resources/linux/code.png" "$antigravity_ide_dir/icon.png"
+                    fi
+
+                    mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
+                    cat << DESKTOP > "$HOME/.local/share/applications/antigravity-ide.desktop"
+[Desktop Entry]
+Name=Antigravity-IDE
+Exec=$antigravity_ide_dir/antigravity-ide --no-sandbox
+Icon=$antigravity_ide_dir/icon.png
+Type=Application
+Terminal=false
+Categories=Development;IDE;
+DESKTOP
+                    cp "$HOME/.local/share/applications/antigravity-ide.desktop" "$HOME/Desktop/" 2>/dev/null || true
+                    chmod +x "$HOME/Desktop/antigravity-ide.desktop" 2>/dev/null || true
+
+                    cat << WRAPPER > "$HOME/.local/bin/antigravity-ide"
+#!/bin/bash
+exec "$antigravity_ide_dir/antigravity-ide" --no-sandbox "\$@"
+WRAPPER
+                    chmod +x "$HOME/.local/bin/antigravity-ide"
+
+                    echo -e "  ${GREEN}[OK] Google Antigravity IDE successfully updated to $latest_ide.${RESET}"
+                else
+                    echo -e "  ${RED}^ WARNING: Extraction failed (Antigravity IDE binary not found in archive).${RESET}"
+                fi
+            else
+                echo -e "  ${RED}^ WARNING: Failed to download Antigravity IDE from $download_url${RESET}"
+            fi
+            rm -rf "$tmp_work_dir"
+        else
+            echo -e "  ${YELLOW}^ WARNING: Unable to fetch Antigravity IDE update endpoint, continuing...${RESET}"
+        fi
+    fi
+else
+    skip_step "Google Antigravity IDE"
+fi
+
+# 9. Claude Code CLI
 if command -v claude &> /dev/null; then
     step "Updating Claude Code CLI"
     claude update || echo -e "  ${RED}^ WARNING: Claude CLI update failed, continuing...${RESET}"
@@ -194,7 +403,7 @@ else
     skip_step "'claude' command"
 fi
 
-# 8. Herdr CLI
+# 10. Herdr CLI
 if command -v herdr &> /dev/null; then
     step "Checking Herdr CLI updates"
     current_herdr="$(herdr --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
@@ -209,7 +418,7 @@ else
     skip_step "'herdr' command"
 fi
 
-# 9. LM Studio Engines & Runtime
+# 11. LM Studio Engines & Runtime
 if command -v lms &> /dev/null; then
     step "Updating LM Studio runtime extensions"
     lms runtime update -y --all || echo -e "  ${RED}^ WARNING: LM Studio runtime update failed, continuing...${RESET}"
@@ -217,9 +426,9 @@ else
     skip_step "'lms' command"
 fi
 
-# 10. Ollama
+# 12. Ollama
 if command -v ollama &> /dev/null; then
-    step "Checking Ollama updates"
+    step "Checking Ollama & model updates"
     current_ollama="$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
     latest_ollama="$(curl -s --max-time 3 "https://api.github.com/repos/ollama/ollama/releases/latest" 2>/dev/null | grep -m1 '"tag_name":' | sed -E 's/.*"v?([0-9.]+).*/\1/' || true)"
     if [ -n "$current_ollama" ] && [ -n "$latest_ollama" ] && [ "$current_ollama" = "$latest_ollama" ]; then
@@ -228,11 +437,30 @@ if command -v ollama &> /dev/null; then
         echo -e "  ${BOLD}[*] Upgrading Ollama (${current_ollama:-unknown} -> ${latest_ollama:-latest})...${RESET}"
         curl -fsSL https://ollama.com/install.sh | sh || echo -e "  ${RED}^ WARNING: Ollama update failed, continuing...${RESET}"
     fi
+
+    # Update installed Ollama models
+    if ollama_list="$(ollama list 2>/dev/null)"; then
+        models="$(echo "$ollama_list" | tail -n +2 | awk '{print $1}' | grep -v '^$' || true)"
+        if [ -n "$models" ]; then
+            echo -e "  ${BOLD}[*] Updating installed Ollama models...${RESET}"
+            while IFS= read -r model; do
+                if [ -n "$model" ]; then
+                    echo -e "  ${BOLD}--> Pulling latest $model...${RESET}"
+                    ollama pull "$model" || echo -e "  ${YELLOW}^ WARNING: Failed to update Ollama model '$model', continuing...${RESET}"
+                fi
+            done <<< "$models"
+            echo -e "  ${GREEN}[OK] Ollama models checked.${RESET}"
+        else
+            echo -e "  ${GREEN}[OK] No Ollama models installed.${RESET}"
+        fi
+    else
+        echo -e "  ${YELLOW}^ WARNING: Ollama service is not running; skipping model updates.${RESET}"
+    fi
 else
     skip_step "'ollama' command"
 fi
 
-# 11. Rust Toolchain (rustup)
+# 13. Rust Toolchain (rustup)
 if command -v rustup &> /dev/null; then
     step "Updating Rust toolchain (rustup)"
     rustup update || echo -e "  ${RED}^ WARNING: rustup update failed, continuing...${RESET}"
@@ -240,7 +468,7 @@ else
     skip_step "'rustup' command"
 fi
 
-# 12. Astral uv
+# 14. Astral uv
 if command -v uv &> /dev/null; then
     step "Updating Astral uv & tools"
     uv self update || echo -e "  ${RED}^ WARNING: uv self update failed, continuing...${RESET}"
@@ -249,7 +477,7 @@ else
     skip_step "'uv' command"
 fi
 
-# 13. Bun Runtime
+# 15. Bun Runtime
 if command -v bun &> /dev/null; then
     step "Updating Bun runtime"
     bun upgrade || echo -e "  ${RED}^ WARNING: Bun upgrade failed, continuing...${RESET}"
@@ -257,7 +485,7 @@ else
     skip_step "'bun' command"
 fi
 
-# 14. Global NPM Packages (Gemini CLI, Claude, etc.)
+# 16. Global NPM Packages (Gemini CLI, Claude, etc.)
 if command -v npm &> /dev/null; then
     step "Updating global NPM packages"
     npm update -g || echo -e "  ${RED}^ WARNING: npm global update failed, continuing...${RESET}"
@@ -265,7 +493,7 @@ else
     skip_step "'npm' command"
 fi
 
-# 15. SDKMAN!
+# 17. SDKMAN!
 if [ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
     step "Updating SDKMAN! & candidates"
     (
@@ -279,7 +507,7 @@ else
     skip_step "SDKMAN!"
 fi
 
-# 16. Go Binaries & Tooling
+# 18. Go Binaries & Tooling
 if command -v go &> /dev/null; then
     step "Updating Go binaries & tooling"
     _update_go_tool "gopls" "golang.org/x/tools/gopls" || echo -e "  ${YELLOW}^ WARNING: gopls update failed.${RESET}"
@@ -288,7 +516,7 @@ else
     skip_step "'go' command"
 fi
 
-# 17. Python, Pip & User CLI Utilities
+# 19. Python, Pip & User CLI Utilities
 if command -v python3 &> /dev/null; then
     step "Updating Python, pip, and user CLI packages"
     echo -e "  ${BOLD}[*] Upgrading pip...${RESET}"
@@ -313,7 +541,7 @@ else
     skip_step "'python3' command"
 fi
 
-# 18. VS Code Extensions
+# 20. VS Code Extensions
 if command -v code &> /dev/null; then
     step "Updating Visual Studio Code extensions"
     code --update-extensions --force >/dev/null 2>&1 || echo -e "  ${YELLOW}^ WARNING: VS Code extension update failed, continuing...${RESET}"
@@ -321,7 +549,7 @@ else
     skip_step "Visual Studio Code ('code')"
 fi
 
-# 19. Micro Editor Plugins
+# 21. Micro Editor Plugins
 if command -v micro &> /dev/null; then
     step "Updating Micro editor plugins"
     micro -plugin update 2>/dev/null || echo -e "  ${YELLOW}^ WARNING: Micro plugins update failed, continuing...${RESET}"
@@ -329,7 +557,7 @@ else
     skip_step "Micro editor ('micro')"
 fi
 
-# 20. Agent Skills & Configurations
+# 22. Agent Skills & Configurations
 if [ -f "$HOME/.agents/.skill-lock.json" ] && command -v npx &> /dev/null; then
     step "Updating agent skills"
     npx -y skills update --yes 2>/dev/null || echo -e "  ${YELLOW}^ WARNING: Agent skills update failed, continuing...${RESET}"
@@ -337,7 +565,7 @@ else
     skip_step "Agent Skills lockfile"
 fi
 
-# 21. GitHub CLI Extensions
+# 23. GitHub CLI Extensions
 if command -v gh &> /dev/null; then
     if gh auth status &>/dev/null; then
         step "Updating GitHub CLI extensions"
@@ -349,7 +577,7 @@ else
     skip_step "'gh' command"
 fi
 
-# 22. Local Git Repositories & Agent Frameworks
+# 24. Local Git Repositories & Agent Frameworks
 step "Updating local Git repositories & documentation"
 _update_git_repo "$HOME/.hermes/hermes-agent"
 # Keep Hermes virtualenv dependencies synchronized if repo was updated
@@ -361,7 +589,7 @@ _update_git_repo "$HOME/projects/docs/compose-samples"
 _update_git_repo "$HOME/projects/docs/horologist"
 _update_git_repo "$HOME/projects/docs/nowinandroid"
 
-# 23. Docker Cleanup
+# 25. Docker Cleanup
 if command -v docker &> /dev/null && systemctl is-active --quiet docker 2>/dev/null; then
     step "Pruning unused Docker dangling images"
     docker image prune -f || echo -e "  ${YELLOW}^ WARNING: Docker image prune failed, continuing...${RESET}"
@@ -369,7 +597,7 @@ else
     skip_step "Docker service"
 fi
 
-# 24. System Journal & SSD Maintenance
+# 26. System Journal & SSD Maintenance
 step "Optimizing system logs (journalctl) and trimming SSD (fstrim)"
 echo -e "  ${BOLD}[*] Vacuuming systemd journal logs (keeping 14 days / max 500MB)...${RESET}"
 sudo journalctl --vacuum-time=14d --vacuum-size=500M >/dev/null 2>&1 || echo -e "  ${YELLOW}^ WARNING: journalctl vacuuming failed, continuing...${RESET}"
