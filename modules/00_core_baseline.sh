@@ -38,6 +38,10 @@ run_core_baseline() {
     echo -e "${BOLD}${CYAN}   Core Fleet Baseline: Verifying & Updating Essentials    ${RESET}"
     echo -e "${BOLD}${CYAN}============================================================${RESET}"
 
+    # Architecture detection (shared by Antigravity Desktop and IDE update steps)
+    local arch
+    arch=$(uname -m)
+
     # 1. C/C++ Build Tools (gcc, make, headers for Rust/C extensions)
     step "Core: C/C++ Build Toolchain (gcc, make, pkgconf)"
     log_action "Verifying C/C++ compiler and build tools..."
@@ -180,8 +184,16 @@ run_core_baseline() {
         fi
         rustup update || true
         if [ -x "$HOME/.cargo/bin/cargo-tauri" ]; then
-            log_action "Updating Cargo tool: tauri-cli..."
-            cargo install tauri-cli --locked 2>/dev/null || true
+            local current_tauri latest_tauri
+            current_tauri="$(cargo tauri --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+            latest_tauri="$(curl -s --max-time 5 'https://crates.io/api/v1/crates/tauri-cli' \
+                2>/dev/null | grep -o '"max_version":"[^"]*"' | cut -d'"' -f4 || true)"
+            if [ -n "$current_tauri" ] && [ -n "$latest_tauri" ] && [ "$current_tauri" = "$latest_tauri" ]; then
+                log_ok "tauri-cli is already up to date ($current_tauri)."
+            else
+                log_action "Updating Cargo tool: tauri-cli (${current_tauri:-unknown} -> $latest_tauri)..."
+                cargo install tauri-cli --locked 2>/dev/null || true
+            fi
         fi
         log_ok "Rust toolchain and Cargo tools are up to date."
     fi
@@ -239,7 +251,8 @@ run_core_baseline() {
     if ! command -v android &>/dev/null && [ ! -d "$android_sdk_dir/cmdline-tools" ]; then
         log_bootstrap "Installing Android SDK Command-line Tools..."
         mkdir -p "$android_sdk_dir/cmdline-tools"
-        local tmp_cmdline="$(mktemp -d -t android-cmdline-XXXXXX)"
+        local tmp_cmdline
+        tmp_cmdline="$(mktemp -d -t android-cmdline-XXXXXX)"
         local cmdline_url="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
         if curl -# -fSL -o "$tmp_cmdline/cmdline.zip" "$cmdline_url" 2>/dev/null; then
             unzip -q "$tmp_cmdline/cmdline.zip" -d "$tmp_cmdline"
@@ -300,12 +313,10 @@ WRAPPER
     if is_antigravity_desktop_running; then
         echo -e "  ${YELLOW}[SKIP] Google Antigravity Desktop is currently active; skipping update.${RESET}"
     else
-        local arch
-        arch=$(uname -m)
         local arch_dir=""
         case "$arch" in
             x86_64|amd64) arch_dir="linux-x64" ;;
-            aarch64|arm64) arch_dir="linux-arm" ;;
+            aarch64|arm64) arch_dir="linux-arm64" ;;
             *) log_warn "Unsupported architecture for Antigravity: $arch" ;;
         esac
 
@@ -382,8 +393,6 @@ WRAPPER
     if is_antigravity_ide_running; then
         echo -e "  ${YELLOW}[SKIP] Google Antigravity IDE is currently active; skipping update to avoid interrupting active work.${RESET}"
     else
-        local arch
-        arch=$(uname -m)
         local arch_ep=""
         case "$arch" in
             x86_64|amd64) arch_ep="linux-x64" ;;

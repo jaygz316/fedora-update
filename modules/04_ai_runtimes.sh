@@ -53,14 +53,18 @@ run_ai_runtimes() {
                     [ -n "$m" ] && model_arr+=("$m")
                 done <<< "$models"
                 local total_models="${#model_arr[@]}"
-                local midx=0
-                log_info "Updating locally installed Ollama models ($total_models detected)..."
-                for model in "${model_arr[@]}"; do
-                    ((midx++))
-                    log_substep "$midx" "$total_models" "Pulling latest $model..."
-                    ollama pull "$model" || log_warn "Failed to pull Ollama model '$model', continuing..."
-                done
-                log_ok "All installed Ollama models updated."
+                if [ "$total_models" -eq 0 ]; then
+                    log_ok "No local Ollama models installed."
+                else
+                    local midx=0
+                    log_info "Updating locally installed Ollama models ($total_models detected)..."
+                    for model in "${model_arr[@]}"; do
+                        ((midx++))
+                        log_substep "$midx" "$total_models" "Pulling latest $model..."
+                        ollama pull "$model" || log_warn "Failed to pull Ollama model '$model', continuing..."
+                    done
+                    log_ok "All installed Ollama models updated."
+                fi
             else
                 log_ok "No local Ollama models installed."
             fi

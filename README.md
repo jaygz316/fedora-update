@@ -108,13 +108,29 @@ If setting up a fresh Fedora installation or a clean VM before Syncthing has syn
   update-all
   ```
 
+- **Preview Only (Dry Run — no system changes made):**
+  ```bash
+  fedora-update --dry-run
+  fedora-update --dry-run --only=dnf
+  ```
+
 - **Targeted Single Module Update:**
   ```bash
   fedora-update --only=core
   fedora-update --only=dnf
   fedora-update --only=flatpak
   fedora-update --only=firmware
+  fedora-update --only=ai
+  fedora-update --only=dev
   fedora-update --only=git
+  fedora-update --only=self
+  fedora-update --only=cleanup
+  ```
+
+- **Skip One or More Modules (comma-separated or repeated flags):**
+  ```bash
+  fedora-update --skip=dnf,flatpak
+  fedora-update --skip=firmware --skip=ai
   ```
 
 Logs are preserved in `~/.local/state/update/last-update.log` and archived chronologically (retaining the last 10 runs).
