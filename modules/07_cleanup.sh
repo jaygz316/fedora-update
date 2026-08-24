@@ -64,7 +64,10 @@ run_cleanup() {
         if sudo dnf needs-restarting -r >/dev/null 2>&1; then
             log_ok "No system reboot required."
         else
-            echo -e "  ${YELLOW}[!] A system reboot is RECOMMENDED (kernel or core system libraries updated).${RESET}"
+            echo -e "\n${BOLD}${RED}╔══════════════════════════════════════════════════════════╗${RESET}"
+            echo -e "${BOLD}${RED}║  ⚠  REBOOT REQUIRED — kernel or core libs updated        ║${RESET}"
+            echo -e "${BOLD}${RED}╚══════════════════════════════════════════════════════════╝${RESET}"
+            echo -e "  Run: ${BOLD}systemctl reboot${RESET}"
         fi
 
         log_info "Active services requiring restart:"

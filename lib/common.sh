@@ -51,7 +51,7 @@ STEP_COUNT=0
 TOTAL_STEPS=0
 
 step() {
-    ((STEP_COUNT++))
+    STEP_COUNT=$((STEP_COUNT + 1))
     if [ "$TOTAL_STEPS" -gt 0 ]; then
         echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}/${TOTAL_STEPS}] $1...${RESET}"
     else
@@ -60,7 +60,7 @@ step() {
 }
 
 skip_step() {
-    ((STEP_COUNT++))
+    STEP_COUNT=$((STEP_COUNT + 1))
     local title="$1"
     local reason="${2:-not found}"
     if [ "$TOTAL_STEPS" -gt 0 ]; then
@@ -99,6 +99,16 @@ log_err() {
 
 log_bootstrap() {
     echo -e "  ${BOLD}${MAGENTA}--> [BOOTSTRAP] $1${RESET}"
+}
+
+# run_or_dry — execute a command normally, or just print it without running in --dry-run mode.
+# Usage: run_or_dry sudo dnf upgrade -y
+run_or_dry() {
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo -e "  ${MAGENTA}[DRY-RUN] Would run: $*${RESET}"
+        return 0
+    fi
+    "$@"
 }
 
 # Logging Initialization

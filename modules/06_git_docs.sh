@@ -8,7 +8,7 @@ run_git_docs() {
     step "Git Docs: Synchronizing local Git documentation and agent frameworks"
 
     local all_repos=()
-    [ -d "$HOME/projects/update/fedora-update" ] && all_repos+=("$HOME/projects/update/fedora-update")
+    # Note: fedora-update self-update is handled by modules/08_self_update.sh (--only=self)
     [ -d "$HOME/.hermes/hermes-agent" ] && all_repos+=("$HOME/.hermes/hermes-agent")
     all_repos+=(
         "$HOME/projects/docs/androidx"

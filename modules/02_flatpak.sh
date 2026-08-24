@@ -75,13 +75,13 @@ run_flatpak() {
     _check_and_mask_downgraded_flatpaks 2>/dev/null || true
 
     # Update flatpaks with live progress
-    if ! flatpak update -y; then
+    if ! run_or_dry flatpak update -y; then
         log_warn "Standard Flatpak update reported issues; checking static-delta fallback..."
-        flatpak update --no-static-deltas -y || true
+        run_or_dry flatpak update --no-static-deltas -y || true
     fi
 
     step "Flatpaks: Cleaning unused runtimes"
     log_action "Searching for unused Flatpak runtimes and extensions..."
-    flatpak uninstall --unused -y || sudo flatpak uninstall --unused -y || true
+    run_or_dry flatpak uninstall --unused -y || run_or_dry sudo flatpak uninstall --unused -y || true
     log_ok "Flatpaks checked and updated."
 }

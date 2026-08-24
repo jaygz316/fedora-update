@@ -151,6 +151,29 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 2.0.0 (Modular Engine)
+- **Current Version:** 2.1.0 (Modular Engine + Serial Timing)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
+
+---
+
+## 7. Changelog
+
+### v2.1.0 (2026-08-24)
+
+**Bug Fixes**
+- `--skip=` now supports comma-separated values and repeated flags (`--skip=dnf,flatpak` or `--skip=dnf --skip=flatpak`).
+- Fixed `local var="$(cmd)"` anti-pattern for `tmp_cmdline` in `00_core_baseline.sh` — declaration now separated from assignment to preserve mktemp exit code.
+- `STEP_COUNT` increment changed from `((++))` to safe arithmetic form (`$((N + 1))`) in both `step()` and `skip_step()` in `lib/common.sh`.
+- Ollama model updater now handles an empty model list without printing misleading `(0 detected)` output.
+- Deduplicated `arch=$(uname -m)` detection in `run_core_baseline()` — was called twice (steps 14 and 15); now hoisted to function top.
+- Normalized Antigravity Desktop ARM arch string from `linux-arm` → `linux-arm64` to match the IDE endpoint.
+
+**New Features**
+- `--dry-run` / `-n` flag: preview all steps without executing any system changes. `run_or_dry()` helper added to `lib/common.sh`; applied to DNF and Flatpak modules.
+- `modules/08_self_update.sh` extracted from `06_git_docs.sh`; available independently as `--only=self`.
+- `run_module()` helper in `bin/fedora-update` wraps every module with per-module elapsed time display.
+- `notify-send` desktop completion notification fires at the end of each run in graphical sessions.
+- High-visibility reboot-required banner (red box) replaces the previous low-contrast `[!]` warning in `07_cleanup.sh`.
+- `tauri-cli` version check added before slow `cargo install --locked` to avoid unnecessary recompilation when already current.
+- `install.sh` warns if `~/.local/bin` is not in `$PATH` after symlinking.

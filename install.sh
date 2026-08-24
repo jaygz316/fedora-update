@@ -42,4 +42,11 @@ if ! command -v syncthing &>/dev/null; then
     echo -e "\033[1;32m[OK] Syncthing installed and running (Web UI: http://0.0.0.0:8384)\033[0m"
 fi
 
+# Warn if ~/.local/bin is not already in PATH
+if [[ ":${PATH}:" != *":$HOME/.local/bin:"* ]]; then
+    echo -e "\n\033[0;33m[!] NOTE: ~/.local/bin is not in your current PATH.\033[0m"
+    echo -e "    Add the following to your ~/.bashrc or ~/.zshrc and restart your shell:"
+    echo -e "    \033[1mexport PATH=\"\$HOME/.local/bin:\$PATH\"\033[0m\n"
+fi
+
 echo -e "\nYou can now run: \033[1;36mupdate\033[0m or \033[1;36mupdate-all\033[0m from any terminal."
