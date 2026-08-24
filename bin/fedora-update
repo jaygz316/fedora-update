@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# bin/fedora-update - Unified Fedora Fleet Maintenance & Toolchain Engine
+#
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Source Libraries
+# shellcheck source=lib/common.sh
+source "$ROOT_DIR/lib/common.sh"
+# shellcheck source=lib/process.sh
+source "$ROOT_DIR/lib/process.sh"
+# shellcheck source=lib/git_guard.sh
+source "$ROOT_DIR/lib/git_guard.sh"
+
+# Source Modules
+for mod in "$ROOT_DIR/modules/"*.sh; do
+    if [ -f "$mod" ]; then
+        # shellcheck disable=SC1090
+        source "$mod"
+    fi
+done
+
+# CLI Flags
+DO_TRIM=false
+ONLY_MODULE=""
+SKIP_MODULE=""
+
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Unified 1-click update and toolchain maintenance suite for Fedora.
+
+Options:
+  --trim             Perform full SSD TRIM (fstrim -av) during cleanup
+  --only=<module>    Run only the specified module (core|dnf|flatpak|firmware|ai|dev|git|cleanup)
+  --skip=<module>    Skip the specified module
+  -h, --help         Display this help message
+
+Commands:
+  update             Runs standard routine maintenance
+  update-all         Runs standard maintenance + SSD TRIM
+
+EOF
+    exit 0
+}
+
+# Parse Command-line Arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --trim)
+            DO_TRIM=true
+            shift
+            ;;
+        --only=*)
+            ONLY_MODULE="${1#*=}"
+            shift
+            ;;
+        --skip=*)
+            SKIP_MODULE="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            # Ignore unknown or legacy args gracefully
+            shift
+            ;;
+    esac
+done
+
+should_run() {
+    local mod_key="$1"
+    if [ -n "$ONLY_MODULE" ] && [ "$ONLY_MODULE" != "$mod_key" ]; then
+        return 1
+    fi
+    if [ -n "$SKIP_MODULE" ] && [ "$SKIP_MODULE" = "$mod_key" ]; then
+        return 1
+    fi
+    return 0
+}
+
+main() {
+    # Initialize logging
+    init_logging
+
+    START_TIME=$(date +%s)
+
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}          Starting Fedora Fleet Maintenance Suite           ${RESET}"
+    echo -e "${BOLD}${CYAN}  Log File: $LOG_FILE${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}\n"
+
+    # Step 0: Ensure permissions and self-registered symlinks in ~/.local/bin
+    chmod +x \
+        "$ROOT_DIR/update" \
+        "$ROOT_DIR/update-all" \
+        "$ROOT_DIR/bin/fedora-update" \
+        "$ROOT_DIR/lib/"*.sh \
+        "$ROOT_DIR/modules/"*.sh 2>/dev/null || true
+
+    mkdir -p "$HOME/.local/bin"
+    if [ ! -L "$HOME/.local/bin/update" ] || [ "$(readlink -f "$HOME/.local/bin/update" 2>/dev/null)" != "$ROOT_DIR/update" ]; then
+        ln -sf "$ROOT_DIR/update" "$HOME/.local/bin/update" 2>/dev/null || true
+    fi
+    if [ ! -L "$HOME/.local/bin/update-all" ] || [ "$(readlink -f "$HOME/.local/bin/update-all" 2>/dev/null)" != "$ROOT_DIR/update-all" ]; then
+        ln -sf "$ROOT_DIR/update-all" "$HOME/.local/bin/update-all" 2>/dev/null || true
+    fi
+    if [ ! -L "$HOME/.local/bin/fedora-update" ] || [ "$(readlink -f "$HOME/.local/bin/fedora-update" 2>/dev/null)" != "$ROOT_DIR/bin/fedora-update" ]; then
+        ln -sf "$ROOT_DIR/bin/fedora-update" "$HOME/.local/bin/fedora-update" 2>/dev/null || true
+    fi
+
+    # Step 0.5: Ensure passwordless sudo & polkit is verified / configured
+    ensure_passwordless_sudo
+
+    # Calculate total steps dynamically based on selected modules
+    TOTAL_STEPS=0
+    should_run "core" && ((TOTAL_STEPS += 18))
+    should_run "dnf" && ((TOTAL_STEPS += 3))
+    should_run "flatpak" && ((TOTAL_STEPS += 2))
+    should_run "firmware" && ((TOTAL_STEPS += 1))
+    should_run "ai" && ((TOTAL_STEPS += 3))
+    should_run "dev" && ((TOTAL_STEPS += 4))
+    should_run "git" && ((TOTAL_STEPS += 1))
+    should_run "cleanup" && {
+        if [ "$DO_TRIM" = "true" ]; then
+            ((TOTAL_STEPS += 4))
+        else
+            ((TOTAL_STEPS += 3))
+        fi
+    }
+    if should_run "core"; then
+        run_core_baseline
+    fi
+
+    # Step 2: OS Packages via DNF
+    if should_run "dnf"; then
+        run_system_dnf
+    fi
+
+    # Step 3: Flatpaks & Runtimes
+    if should_run "flatpak"; then
+        run_flatpak
+    fi
+
+    # Step 4: Hardware & System Firmware (LVFS)
+    if should_run "firmware"; then
+        run_firmware
+    fi
+
+    # Step 5: Secondary AI Runtimes (Claude Code, LM Studio, Ollama installed models)
+    if should_run "ai"; then
+        run_ai_runtimes
+    fi
+
+    # Step 6: Dev Toolchains (SDKMAN!, gcloud, VS Code, Agent Skills)
+    if should_run "dev"; then
+        run_dev_toolchains
+    fi
+
+    # Step 7: Local Documentation & Git Repositories
+    if should_run "git"; then
+        run_git_docs
+    fi
+
+    # Step 8: System Cleanup & Reboot Checks
+    if should_run "cleanup"; then
+        run_cleanup "$DO_TRIM"
+    fi
+
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+
+    echo -e "\n${BOLD}${GREEN}============================================================${RESET}"
+    echo -e "${BOLD}${GREEN}  --- Update process complete in ${DURATION}s! ---${RESET}"
+    echo -e "${CYAN}  Full execution log saved to: ${LOG_FILE}${RESET}"
+    echo -e "${BOLD}${GREEN}============================================================${RESET}\n"
+}
+
+main "$@"

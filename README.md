@@ -1,83 +1,120 @@
 # Fedora Update (`fedora-update`)
 
-A modular, standalone system update and maintenance automation suite tailored for **Fedora Linux** power users and developers.
+A robust, 1-click multi-node system maintenance and toolchain synchronization suite tailored for **Fedora Linux** power users, developers, and multi-machine fleets.
 
-It unifies OS packages, Flatpaks, developer toolchains, AI runtimes, CLI utilities, local documentation repositories, and system cleanup into a single streamlined command.
-
----
-
-## ⚡ Key Features
-
-- **Package Managers & System**:
-  - Refreshes repositories and upgrades DNF packages (`dnf upgrade --refresh`, `dnf autoremove`, `dnf clean packages`).
-  - Updates Flatpaks with automatic fallback for Flathub delta decompression limits (`--no-static-deltas`) and prunes orphaned runtimes.
-  - Checks hardware & system firmware via LVFS (`fwupdmgr`).
-- **Developer & AI Toolchains**:
-  - **AI Engines & CLI Agents**: Google Antigravity Desktop & IDE, Agy CLI (`agy`), Claude Code (`claude`), Herdr CLI (`herdr`), Ollama runtime & models (`ollama`), and agent skills.
-  - **Runtimes & Package Managers**: Astral `uv` & tools, `bun`, global `npm` packages, Go tooling (`gopls`, `dlv`), and user `pip` CLI tools.
-  - **SDKs & Editors**: Android SDK (`android`), Visual Studio Code extensions, Micro editor plugins, and GitHub CLI extensions (`gh`).
-- **Documentation & Git Repositories**:
-  - Safely fetches and syncs local Git repositories and documentation frameworks with upstream (`git pull --rebase --autostash`).
-- **System Maintenance & Cleanup**:
-  - Prunes dangling Docker images (`docker image prune -f`).
-  - Vacuums old systemd journal logs (`journalctl --vacuum-time=14d --vacuum-size=500M`).
-  - **`update-all` only:** Executes full SSD TRIM (`fstrim -av`).
-- **Post-Update Intelligence**:
-  - Checks if a kernel, glibc, or systemd reboot is required (`dnf needs-restarting -r`).
-  - Lists active background services requiring restarts (`dnf needs-restarting -s`).
-- **Logging**:
-  - Full execution output is automatically mirrored to terminal and logged under `~/.local/state/update/`.
+Designed to keep 3 to 5 heterogeneous Fedora machines (development workstations, personal machines, lightweight VMs) synchronized and up to date without manual friction.
 
 ---
 
-## 📦 Scripts Included
+## ⚡ Key Highlights
 
-| Script | Purpose |
-| :--- | :--- |
-| **`update`** | **Fast routine maintenance.** Runs all package and toolchain updates, Docker prune, and journal log vacuuming. |
-| **`update-all`** | **Complete deep maintenance.** Includes everything in `update` plus full storage hardware maintenance (SSD `fstrim`). |
+- **1-Click Fleet Experience**: Run `update` or `update-all` on any Fedora machine. No manual profile management required.
+- **Core Fleet Baseline**: Automatically bootstraps and keeps updated all essential toolchains on any machine (even a fresh minimal VM):
+  - **AI Ecosystem**: Google Antigravity Desktop, Google Antigravity IDE, Agy CLI (`agy`), Herdr CLI (`herdr`).
+  - **Development Languages**: Rust (`rustup`), Bun (`bun`), Go + `gopls`/`dlv`, Astral `uv`, Python `pip`.
+  - **Containers & Sync**: Docker Engine & Compose, Syncthing (with Web GUI configured on `0.0.0.0:8384` and systemd service enabled).
+  - **Android Toolchains**: Android SDK / CLI (`android`), Android Studio Latest Preview.
+  - **Utilities & Package Managers**: Micro editor, GitHub CLI (`gh`), safe NPM user prefix (`~/.npm-global`), C/C++ build tools (`gcc`, `make`).
+  - **Python CLI Tools**: `esptool`, `meshtastic`, `openai-whisper`, `google-antigravity`, `google-genai`, `mcp`, `rich-click`, `tabulate`, `pyinstaller`, `uvicorn`, `websockets`, `setuptools`.
+- **Dynamic Installed-Only Updates**: If present on the host, automatically updates:
+  - DNF packages & repositories (`upgrade --refresh`, `autoremove`, `clean packages`).
+  - Flatpaks & runtimes (with delta decompression fallback and unused runtime pruning).
+  - Hardware & system firmware via LVFS (`fwupdmgr`).
+  - Secondary AI tools (Claude Code, LM Studio, Ollama engine & locally installed models).
+  - SDKMAN! candidates, Google Cloud SDK (`gcloud`), VS Code extensions, Micro plugins, Agent skills.
+  - Git documentation repositories (`~/projects/docs/*`, `~/.hermes/hermes-agent`).
+- **Active Agent & App Protection**: Checks if an AI agent, IDE, or app is actively working. If busy, cleanly skips updating that component to prevent crashing your session.
+- **Syncthing & Concurrency Safe**: Protects Git repos in synced folders (`~/projects/`) from dirty-tree rebase conflicts.
+- **Automated Passwordless Sudo & Polkit**: Verifies sudo and Polkit permissions on launch and configures `/etc/sudoers.d/$USER` and `/etc/polkit-1/rules.d/` for promptless 1-click execution.
+- **Post-Update Intelligence**: Checks for required kernel/glibc reboots (`dnf needs-restarting -r`) and active services requiring restart (`dnf needs-restarting -s`).
 
 ---
 
-## 🚀 Installation & Setup
+## 📦 Scripts & Architecture
+
+```
+fedora-update/
+├── install.sh                  # 1-step installer & Syncthing bootstrapper for new nodes
+├── update                      # Top-level 1-click routine maintenance runner
+├── update-all                  # Top-level 1-click maintenance + SSD TRIM runner
+├── bin/
+│   └── fedora-update           # Unified modular engine (supports --trim, --only=, --skip=)
+├── lib/
+│   ├── common.sh               # Colors, logging, dynamic steps, passwordless sudo & polkit setup
+│   ├── process.sh              # Active process & agent busy detection
+│   └── git_guard.sh            # Syncthing-safe Git dirty-tree checks
+└── modules/
+    ├── 00_core_baseline.sh     # Core Fleet Baseline installer & updater (includes Syncthing 0.0.0.0)
+    ├── 01_system_dnf.sh        # DNF upgrade, autoremove, clean
+    ├── 02_flatpak.sh           # Flatpak updates + static-delta fallback + unused cleanup
+    ├── 03_firmware.sh          # LVFS firmware updates
+    ├── 04_ai_runtimes.sh       # Claude Code, LM Studio, Ollama & installed models
+    ├── 05_dev_toolchains.sh    # SDKMAN!, gcloud, VS Code extensions, Agent skills
+    ├── 06_git_docs.sh          # Local Git doc repos & Hermes framework
+    └── 07_cleanup.sh           # Docker image prune, journalctl vacuum, optional fstrim
+```
+
+---
+
+## 🚀 Setting Up a New Computer
+
+### Scenario A: Syncthing is Already Connected (Standard Flow)
+Because Syncthing automatically replicates `~/projects/` across all your nodes, the repository will already exist on your new computer at `~/projects/update/fedora-update`.
+
+1. Run the 1-step installer:
+   ```bash
+   ~/projects/update/fedora-update/install.sh
+   ```
+   *(Or simply run `~/projects/update/fedora-update/update` once—it will self-register the symlinks into `~/.local/bin/` automatically!)*
+
+2. From then on, simply type:
+   ```bash
+   update
+   ```
+
+---
+
+### Scenario B: Brand New Computer (Before Syncthing is Set Up)
+If setting up a fresh Fedora installation or a clean VM before Syncthing has synced:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/jaygz316/fedora-update.git ~/projects/update/fedora
+   git clone https://github.com/jaygz316/fedora-update.git ~/projects/update/fedora-update
    ```
 
-2. **Install scripts into your user path:**
+2. **Run the 1-step installer:**
    ```bash
-   mkdir -p ~/.local/bin
-   cp ~/projects/update/fedora/update ~/.local/bin/
-   cp ~/projects/update/fedora/update-all ~/.local/bin/
-   chmod +x ~/.local/bin/update ~/.local/bin/update-all
+   ~/projects/update/fedora-update/install.sh
    ```
+   *This automatically registers `update` in `~/.local/bin`, installs **Syncthing**, configures its Web UI to listen on `0.0.0.0:8384` across your LAN, and activates its systemd user service.*
 
-3. **Ensure `~/.local/bin` is in your `PATH`:**
+3. **Run your first update:**
    ```bash
-   export PATH="$HOME/.local/bin:$PATH"
+   update
    ```
-
-4. **(Optional) Configure passwordless `sudo`:**
-   To run unattended without interactive sudo prompts, configure a sudoers drop-in file:
-   ```bash
-   echo "$USER ALL=(ALL:ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$USER
-   sudo chmod 0440 /etc/sudoers.d/$USER
-   ```
+   *The first run will prompt for your sudo password once to configure passwordless sudo & Polkit, then bootstrap all Core Fleet Baseline tools (compilers, Docker, Android SDK/Studio, Antigravity Desktop/IDE, uv, pip, Python CLI tools).*
 
 ---
 
 ## 🛠️ Usage
 
-Simply run:
-```bash
-update
-```
+- **Routine Daily Maintenance:**
+  ```bash
+  update
+  ```
 
-Or for complete maintenance including SSD trim:
-```bash
-update-all
-```
+- **Deep Maintenance (Including SSD TRIM):**
+  ```bash
+  update-all
+  ```
+
+- **Targeted Single Module Update:**
+  ```bash
+  fedora-update --only=core
+  fedora-update --only=dnf
+  fedora-update --only=flatpak
+  fedora-update --only=firmware
+  fedora-update --only=git
+  ```
 
 Logs are preserved in `~/.local/state/update/last-update.log` and archived chronologically (retaining the last 10 runs).
