@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-#
-# update-all: Standalone 1-click system update & deep storage maintenance (+ SSD TRIM)
-# Location: ~/.local/bin/update-all or ~/projects/update/fedora-update/update-all
-#
-
-set -u
-
+# update-all — same as `update` but also performs SSD TRIM (fstrim -av)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-if [ -f "$SCRIPT_DIR/bin/fedora-update" ]; then
-    exec "$SCRIPT_DIR/bin/fedora-update" --trim "$@"
-elif [ -f "$HOME/projects/update/fedora-update/bin/fedora-update" ]; then
-    exec "$HOME/projects/update/fedora-update/bin/fedora-update" --trim "$@"
-else
-    echo "Error: fedora-update engine not found." >&2
-    exit 1
-fi
+exec "$SCRIPT_DIR/update" --trim "$@"

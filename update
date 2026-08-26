@@ -1,18 +1,974 @@
 #!/usr/bin/env bash
+# update — Fedora Fleet Maintenance & Toolchain Sync Suite
 #
-# update: Standalone 1-click routine system update & toolchain sync utility
-# Location: ~/.local/bin/update or ~/projects/update/fedora-update/update
+# Keeps a fleet of Fedora machines fully updated with one command.
+# Synced across machines via Syncthing (~/.gemini, ~/projects/).
 #
+# Usage: update [OPTIONS]
+#   --trim           Also perform SSD TRIM (fstrim -av)
+#   --only=MODULE    Run only one section: core|dnf|flatpak|firmware|ai|dev|git|self|cleanup
+#   --skip=MODULES   Skip sections; comma-separated or repeated flag
+#   --dry-run, -n    Preview steps without making system changes
+#   -h, --help       Show this help
+#
+# Run order: core -> dnf -> flatpak -> firmware -> ai -> dev -> git -> self -> cleanup
 
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+###############################################################################
+# PATH — all user toolchain binaries available on any node
+###############################################################################
+for _dir in \
+    "$HOME/.local/bin" "$HOME/bin" "$HOME/.cargo/bin" "$HOME/.bun/bin" \
+    "$HOME/.npm-global/bin" "$HOME/.lmstudio/bin" "$HOME/google-cloud-sdk/bin" \
+    "$HOME/go/bin" "$HOME/Android/Sdk/cmdline-tools/latest/bin" \
+    "$HOME/Android/Sdk/platform-tools" "$HOME/Android/Sdk/emulator" \
+    "$HOME/.local/opt/android-studio-preview/bin"
+do
+    [ -d "$_dir" ] && [[ ":$PATH:" != *":$_dir:"* ]] && PATH="$_dir:$PATH"
+done
+export PATH
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env" 2>/dev/null || true
 
-if [ -f "$SCRIPT_DIR/bin/fedora-update" ]; then
-    exec "$SCRIPT_DIR/bin/fedora-update" "$@"
-elif [ -f "$HOME/projects/update/fedora-update/bin/fedora-update" ]; then
-    exec "$HOME/projects/update/fedora-update/bin/fedora-update" "$@"
-else
-    echo "Error: fedora-update engine not found." >&2
-    exit 1
-fi
+###############################################################################
+# COLORS & ENVIRONMENT
+###############################################################################
+BOLD="\033[1m"; GREEN="\033[0;32m"; YELLOW="\033[0;33m"
+RED="\033[0;31m"; CYAN="\033[0;36m"; MAGENTA="\033[0;35m"; RESET="\033[0m"
+export PYTHONUNBUFFERED=1 GIT_TERMINAL_PROMPT=0 FORCE_COLOR=1 CLICOLOR_FORCE=1
+
+###############################################################################
+# STEP COUNTER & LOGGING HELPERS
+###############################################################################
+STEP_COUNT=0; TOTAL_STEPS=0
+
+step() {
+    STEP_COUNT=$((STEP_COUNT + 1))
+    [ "$TOTAL_STEPS" -gt 0 ] \
+        && echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}/${TOTAL_STEPS}] $1...${RESET}" \
+        || echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}] $1...${RESET}"
+}
+skip_step() {
+    STEP_COUNT=$((STEP_COUNT + 1))
+    local title="$1" reason="${2:-not found}"
+    [ "$TOTAL_STEPS" -gt 0 ] \
+        && echo -e "\n${YELLOW}[-] [${STEP_COUNT}/${TOTAL_STEPS}] ${title} (${reason}, skipping)${RESET}" \
+        || echo -e "\n${YELLOW}[-] [${STEP_COUNT}] ${title} (${reason}, skipping)${RESET}"
+}
+log_substep()  { echo -e "  ${BOLD}${CYAN}--> [$1/$2]${RESET} $3"; }
+log_action()   { echo -e "  ${CYAN}... $1${RESET}"; }
+log_info()     { echo -e "  ${BOLD}[*] $1${RESET}"; }
+log_ok()       { echo -e "  ${GREEN}[OK] $1${RESET}"; }
+log_warn()     { echo -e "  ${YELLOW}^ WARNING: $1${RESET}"; }
+log_err()      { echo -e "  ${RED}^ ERROR: $1${RESET}"; }
+log_bootstrap(){ echo -e "  ${BOLD}${MAGENTA}--> [BOOTSTRAP] $1${RESET}"; }
+
+# Execute a command, or in --dry-run mode just print it without running
+run_or_dry() {
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo -e "  ${MAGENTA}[DRY-RUN] Would run: $*${RESET}"; return 0
+    fi
+    "$@"
+}
+
+###############################################################################
+# LOGGING — tee to timestamped log + ~/.local/state/update/last-update.log
+###############################################################################
+init_logging() {
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/update"
+    mkdir -p "$log_dir"
+    LOG_FILE="$log_dir/update_$(date +%Y%m%d_%H%M%S).log"
+    find "$log_dir" -name "update_*.log" -type f 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
+    exec > >(tee -a "$LOG_FILE" | tee "$log_dir/last-update.log") 2>&1
+}
+
+###############################################################################
+# PASSWORDLESS SUDO & POLKIT AUTO-SETUP
+###############################################################################
+ensure_passwordless_sudo() {
+    ! command -v sudo &>/dev/null && { log_warn "'sudo' not found."; return 0; }
+    local sudoers_file="/etc/sudoers.d/$USER"
+    local polkit_rule="/etc/polkit-1/rules.d/49-nopasswd-fedora-update.rules"
+
+    _write_polkit_rule() {
+        [ -d "/etc/polkit-1/rules.d" ] && [ ! -f "$polkit_rule" ] || return 0
+        sudo tee "$polkit_rule" >/dev/null <<EOF
+polkit.addRule(function(action, subject) {
+    if (subject.user == "$USER" || subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+        sudo chmod 0644 "$polkit_rule" 2>/dev/null || true
+    }
+
+    if sudo -n true 2>/dev/null; then
+        _write_polkit_rule
+        log_ok "Passwordless sudo & Polkit verified."
+    else
+        echo -e "\n${BOLD}${CYAN}------------------------------------------------------------${RESET}"
+        echo -e "${CYAN}  Configuring passwordless sudo for 1-click runs...${RESET}"
+        echo -e "${BOLD}${CYAN}------------------------------------------------------------${RESET}"
+        if [ -t 0 ] || [ -e /dev/tty ]; then
+            if sudo -v; then
+                echo "$USER ALL=(ALL:ALL) NOPASSWD: ALL" | sudo tee "$sudoers_file" >/dev/null
+                sudo chmod 0440 "$sudoers_file"; sudo chown root:root "$sudoers_file" 2>/dev/null || true
+                _write_polkit_rule
+                sudo -n true 2>/dev/null \
+                    && log_ok "Passwordless sudo configured for $USER." \
+                    || log_warn "Configured rules but validation returned non-zero."
+            else
+                log_warn "Authentication failed. Privileged operations may prompt."
+            fi
+        else
+            log_warn "Non-interactive session. Run 'update' in a terminal once to finish setup."
+        fi
+    fi
+
+    # Keep sudo ticket alive for the duration of the run
+    if sudo -n true 2>/dev/null; then
+        while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
+        local _sudo_pid=$!
+        trap 'kill "$_sudo_pid" 2>/dev/null || true' EXIT
+    fi
+}
+
+###############################################################################
+# PROCESS DETECTION — protect running apps/agents from being updated mid-session
+###############################################################################
+_is_process_excluded() {
+    local pid="$1"
+    { [ "$pid" = "$$" ] || [ "$pid" = "${PPID:-0}" ] || [ "$pid" = "${BASHPID:-$$}" ]; } && return 0
+    local comm; comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    case "$comm" in pgrep|grep|bash|sh|zsh) return 0 ;; esac
+    local cmdline; cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    [[ "$cmdline" == *"telemetry_hook_bundle.js"* || "$cmdline" == *"fedora-update"* ]] && return 0
+    return 1
+}
+_pids_running() {
+    # Returns 0 if any non-excluded pid from pgrep output is running
+    local pids="$1"
+    [ -z "$pids" ] && return 1
+    for pid in $pids; do _is_process_excluded "$pid" || return 0; done
+    return 1
+}
+is_process_exact_running() { _pids_running "$(pgrep -x "$1" 2>/dev/null || true)"; }
+is_vscode_running()          { is_process_exact_running "code"; }
+is_antigravity_ide_running() { is_process_exact_running "antigravity-ide"; }
+is_android_studio_running() {
+    local pids; pids="$(pgrep -f 'com.intellij.idea.Main|/android-studio' 2>/dev/null || true)"
+    [ -z "$pids" ] && { is_process_exact_running "studio.sh" || is_process_exact_running "studio64"; return; }
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        local c; c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        [[ "$c" == *"android-studio"* || "$c" == *"com.intellij.idea.Main"* ]] && return 0
+    done; return 1
+}
+is_antigravity_desktop_running() {
+    local pids; pids="$(pgrep -x antigravity 2>/dev/null || true)"
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        local c; c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        [[ "$c" == *"/opt/antigravity/antigravity"* && "$c" != *"antigravity-cli"* && "$c" != *"antigravity-ide"* ]] && return 0
+    done; return 1
+}
+is_cli_running() {
+    local name="$1"
+    local pids; pids="$(pgrep -x "$name" 2>/dev/null || true)"
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        [ "$name" = "herdr" ] && { local c; c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true); [[ "$c" == *"server"* ]] && continue; }
+        return 0
+    done; return 1
+}
+
+###############################################################################
+# GIT GUARD — Syncthing-safe git pull (skips on dirty working tree)
+###############################################################################
+safe_git_repo_update() {
+    local repo_path="$1"
+    local repo_name; repo_name="$(basename "$repo_path")"
+    [ ! -d "$repo_path" ] && { log_warn "$repo_name not found, skipping."; return 0; }
+    (
+        cd "$repo_path" || return 1
+        git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_warn "$repo_name is not a git repo."; return 1; }
+        log_action "Inspecting $repo_name..."
+        export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15"
+        local dirty; dirty="$(git status --porcelain 2>/dev/null || true)"
+        if [ -n "$dirty" ]; then
+            echo -e "  ${YELLOW}[SKIP] Local changes in $repo_name; skipping pull to avoid Syncthing conflicts.${RESET}"
+            return 0
+        fi
+        log_action "Fetching upstream for $repo_name..."
+        timeout 45s git fetch --all --prune 2>/dev/null || { log_warn "Fetch timed out for $repo_name."; return 0; }
+        local local_c upstream_c
+        local_c="$(git rev-parse HEAD 2>/dev/null || true)"
+        upstream_c="$(git rev-parse '@{u}' 2>/dev/null || true)"
+        if [ -n "$local_c" ] && [ -n "$upstream_c" ] && [ "$local_c" = "$upstream_c" ]; then
+            log_ok "$repo_name is already up to date."
+        else
+            timeout 60s git pull --rebase --autostash \
+                && log_ok "$repo_name synchronized." \
+                || log_warn "Pull/rebase failed for $repo_name."
+        fi
+    ) || log_warn "Git operation failed on $repo_path"
+}
+
+###############################################################################
+# SECTION: CORE FLEET BASELINE
+# Guaranteed on every node. Installs if missing, updates if present.
+###############################################################################
+_update_or_install_go_tool() {
+    local bin_name="$1" install_path="$2"
+    local bin_path="$HOME/go/bin/$bin_name"
+    if [ -x "$bin_path" ]; then
+        local mod_line mod_path current_ver latest_ver
+        mod_line="$(go version -m "$bin_path" 2>/dev/null | grep -E "^\s*mod\s+" | head -n 1)"
+        mod_path="$(echo "$mod_line" | awk '{print $2}')"
+        current_ver="$(echo "$mod_line" | awk '{print $3}')"
+        if [ -n "$mod_path" ]; then
+            latest_ver="$(curl -s --max-time 3 "https://proxy.golang.org/$mod_path/@latest" 2>/dev/null | grep -o '"Version":"[^"]*"' | cut -d'"' -f4 || true)"
+        fi
+        if [ -n "$current_ver" ] && [ -n "$latest_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
+            log_ok "$bin_name already up to date ($current_ver)."; return 0
+        fi
+    fi
+    log_info "Installing/updating $bin_name..."
+    go install "$install_path@latest"
+}
+
+run_core_baseline() {
+    echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}   Core Fleet Baseline: Verifying & Updating Essentials    ${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+
+    local arch; arch=$(uname -m)   # shared by Antigravity Desktop + IDE steps below
+
+    # 1. C/C++ Build Tools
+    step "Core: C/C++ Build Toolchain (gcc, make, pkgconf)"
+    if ! command -v gcc &>/dev/null || ! command -v make &>/dev/null; then
+        log_bootstrap "Installing gcc, gcc-c++, make, pkgconf..."
+        sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config 2>/dev/null || true
+    fi
+    command -v gcc &>/dev/null && log_ok "C/C++ build tools verified."
+
+    # 2. Python & pip
+    step "Core: Python 3 & pip"
+    if ! python3 -c "import pip" &>/dev/null; then
+        log_bootstrap "Installing python3-pip..."
+        sudo dnf install -y python3-pip || python3 -m ensurepip --user || true
+    fi
+    python3 -c "import pip" &>/dev/null \
+        && { python3 -m pip install --user --upgrade pip 2>/dev/null || true; log_ok "pip up to date."; } \
+        || log_warn "pip installation could not be completed."
+
+    # 3. Astral uv
+    step "Core: Astral uv package manager"
+    if ! command -v uv &>/dev/null; then
+        log_bootstrap "Installing Astral uv..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    else
+        uv self update 2>/dev/null || true; log_ok "uv up to date."
+    fi
+
+    # 4. NPM Global Prefix & Tools
+    step "Core: NPM Global Configuration & Tools"
+    if command -v npm &>/dev/null; then
+        local npm_prefix; npm_prefix="$(npm config get prefix 2>/dev/null || true)"
+        if [ "$npm_prefix" = "/usr" ] || [ "$npm_prefix" = "/usr/local" ] || [ -z "$npm_prefix" ]; then
+            log_bootstrap "Configuring user npm prefix → $HOME/.npm-global"
+            mkdir -p "$HOME/.npm-global/bin" "$HOME/.npm-global/lib"
+            npm config set prefix "$HOME/.npm-global"; export PATH="$HOME/.npm-global/bin:$PATH"
+        fi
+        npm update -g 2>/dev/null || true
+        log_ok "NPM global config synced."
+    fi
+
+    # 5. Python CLI Tools (uv tool / pip)
+    step "Core: Python CLI Utilities Suite"
+    local cli_tools=( esptool meshtastic openai-whisper mcp rich-click tabulate pyinstaller uvicorn websockets )
+    local user_libs=( google-antigravity google-genai setuptools )
+    local total_tools="${#cli_tools[@]}" tidx=0
+    if command -v uv &>/dev/null; then
+        uv tool upgrade --all 2>/dev/null || true
+        for tool in "${cli_tools[@]}"; do
+            ((tidx++)); log_substep "$tidx" "$total_tools" "Verifying $tool..."
+            uv tool install --upgrade "$tool" 2>/dev/null || true
+        done
+        python3 -m pip install --user --upgrade "${user_libs[@]}" 2>/dev/null || true
+        uv cache prune 2>/dev/null || true
+        log_ok "Python CLI utilities synchronized."
+    elif python3 -c "import pip" &>/dev/null; then
+        for tool in "${cli_tools[@]}" "${user_libs[@]}"; do
+            ((tidx++)); log_substep "$tidx" "$((total_tools + ${#user_libs[@]}))" "Verifying $tool..."
+            python3 -m pip install --user --upgrade "$tool" 2>/dev/null || true
+        done
+        log_ok "Python CLI utilities synced via pip."
+    fi
+
+    # 6. Micro Editor
+    step "Core: Micro Editor"
+    if ! command -v micro &>/dev/null; then
+        log_bootstrap "Installing Micro editor..."
+        sudo dnf install -y micro 2>/dev/null || (curl https://getmic.ro | bash && mv micro "$HOME/.local/bin/") 2>/dev/null || true
+    fi
+    command -v micro &>/dev/null && { micro -plugin update 2>/dev/null || true; log_ok "Micro editor + plugins up to date."; }
+
+    # 7. GitHub CLI (gh)
+    step "Core: GitHub CLI (gh)"
+    ! command -v gh &>/dev/null && { log_bootstrap "Installing GitHub CLI..."; sudo dnf install -y gh 2>/dev/null || true; }
+    command -v gh &>/dev/null && {
+        gh auth status &>/dev/null && gh extension upgrade --all 2>/dev/null || true
+        log_ok "GitHub CLI ready."
+    }
+
+    # 8. Rust (rustup) + cargo tools
+    step "Core: Rust Toolchain & Cargo Tools (rustup)"
+    if ! command -v rustup &>/dev/null && [ ! -f "$HOME/.cargo/bin/rustup" ]; then
+        log_bootstrap "Installing Rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+        export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+    if command -v rustup &>/dev/null || [ -x "$HOME/.cargo/bin/rustup" ]; then
+        [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+        rustup update || true
+        if [ -x "$HOME/.cargo/bin/cargo-tauri" ]; then
+            local current_tauri latest_tauri
+            current_tauri="$(cargo tauri --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+            latest_tauri="$(curl -s --max-time 5 'https://crates.io/api/v1/crates/tauri-cli' 2>/dev/null | grep -o '"max_version":"[^"]*"' | cut -d'"' -f4 || true)"
+            if [ -n "$current_tauri" ] && [ -n "$latest_tauri" ] && [ "$current_tauri" = "$latest_tauri" ]; then
+                log_ok "tauri-cli already up to date ($current_tauri)."
+            else
+                log_action "Updating tauri-cli (${current_tauri:-unknown} -> $latest_tauri)..."
+                cargo install tauri-cli --locked 2>/dev/null || true
+            fi
+        fi
+        log_ok "Rust toolchain up to date."
+    fi
+
+    # 9. Bun Runtime
+    step "Core: Bun JavaScript/TypeScript Runtime"
+    if ! command -v bun &>/dev/null; then
+        log_bootstrap "Installing Bun..."; curl -fsSL https://bun.sh/install | bash; export PATH="$HOME/.bun/bin:$PATH"
+    else
+        bun upgrade 2>/dev/null || true; log_ok "Bun up to date."
+    fi
+
+    # 10. Go + tooling (gopls, dlv)
+    step "Core: Go Compiler & Developer Tooling"
+    ! command -v go &>/dev/null && { log_bootstrap "Installing Go via DNF..."; sudo dnf install -y golang 2>/dev/null || true; }
+    command -v go &>/dev/null && {
+        _update_or_install_go_tool "gopls" "golang.org/x/tools/gopls" || true
+        _update_or_install_go_tool "dlv"   "github.com/go-delve/delve/cmd/dlv" || true
+        log_ok "Go tooling verified."
+    }
+
+    # 11. Docker Engine & Compose
+    step "Core: Docker Engine & Docker Compose"
+    if ! command -v docker &>/dev/null; then
+        log_bootstrap "Installing Docker CE + Compose plugin..."
+        sudo dnf -y install dnf-plugins-core 2>/dev/null || true
+        sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo 2>/dev/null || \
+            sudo dnf config-manager addrepo --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo 2>/dev/null || true
+        sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+        sudo systemctl enable --now docker 2>/dev/null || true
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        log_ok "Docker installed and service activated."
+    else
+        systemctl is-active --quiet docker 2>/dev/null || sudo systemctl enable --now docker 2>/dev/null || true
+        log_ok "Docker Engine active."
+    fi
+
+    # 12. Android CLI & SDK
+    step "Core: Android CLI & SDK Tools"
+    local android_sdk_dir="$HOME/Android/Sdk"
+    if ! command -v android &>/dev/null && [ ! -d "$android_sdk_dir/cmdline-tools" ]; then
+        log_bootstrap "Installing Android SDK Command-line Tools..."
+        mkdir -p "$android_sdk_dir/cmdline-tools"
+        local tmp_cmdline
+        tmp_cmdline="$(mktemp -d -t android-cmdline-XXXXXX)"
+        if curl -# -fSL -o "$tmp_cmdline/cmdline.zip" \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" 2>/dev/null; then
+            unzip -q "$tmp_cmdline/cmdline.zip" -d "$tmp_cmdline"
+            rm -rf "$android_sdk_dir/cmdline-tools/latest"
+            mv "$tmp_cmdline/cmdline-tools" "$android_sdk_dir/cmdline-tools/latest"
+            mkdir -p "$HOME/.local/bin"
+            cat << 'WRAPPER' > "$HOME/.local/bin/android"
+#!/usr/bin/env bash
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+exec "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "$@"
+WRAPPER
+            chmod +x "$HOME/.local/bin/android"
+            log_ok "Android SDK Command-line Tools installed."
+        else
+            log_warn "Failed to download Android commandlinetools."
+        fi
+        rm -rf "$tmp_cmdline"
+    elif command -v android &>/dev/null; then
+        android update 2>/dev/null || true; log_ok "Android CLI up to date."
+    fi
+
+    # 13. Android Studio Preview
+    step "Core: Android Studio Latest Preview"
+    local studio_preview_dir="$HOME/.local/opt/android-studio-preview"
+    if is_android_studio_running; then
+        echo -e "  ${YELLOW}[SKIP] Android Studio is running; skipping update.${RESET}"
+    elif [ ! -d "$studio_preview_dir" ] && [ ! -f "$HOME/.local/bin/android-studio-preview" ]; then
+        log_bootstrap "Setting up Android Studio Preview launchers..."
+        mkdir -p "$studio_preview_dir" "$HOME/.local/share/applications" "$HOME/.local/bin"
+        cat << DESKTOP > "$HOME/.local/share/applications/android-studio-preview.desktop"
+[Desktop Entry]
+Name=Android Studio Preview
+Exec=$studio_preview_dir/bin/studio.sh
+Icon=$studio_preview_dir/bin/studio.png
+Type=Application
+Terminal=false
+Categories=Development;IDE;
+DESKTOP
+        cat << WRAPPER > "$HOME/.local/bin/android-studio-preview"
+#!/usr/bin/env bash
+exec "$studio_preview_dir/bin/studio.sh" "\$@"
+WRAPPER
+        chmod +x "$HOME/.local/bin/android-studio-preview"
+        log_ok "Android Studio Preview launchers registered."
+    else
+        log_ok "Android Studio Preview verified."
+    fi
+
+    # 14. Google Antigravity Desktop
+    step "Core: Google Antigravity Desktop"
+    local antigravity_dir="$HOME/.local/opt/antigravity"
+    if is_antigravity_desktop_running; then
+        echo -e "  ${YELLOW}[SKIP] Antigravity Desktop is active; skipping update.${RESET}"
+    else
+        local arch_dir=""
+        case "$arch" in x86_64|amd64) arch_dir="linux-x64" ;; aarch64|arm64) arch_dir="linux-arm64" ;;
+            *) log_warn "Unsupported arch for Antigravity Desktop: $arch" ;;
+        esac
+        if [ -n "$arch_dir" ]; then
+            local manifest_data; manifest_data="$(curl -s --max-time 5 \
+                'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-x64-linux.yml' \
+                2>/dev/null || true)"
+            local current_ver=""; [ -f "$antigravity_dir/.version" ] && current_ver="$(cat "$antigravity_dir/.version" 2>/dev/null || true)"
+            local latest_ver; latest_ver="$(echo "$manifest_data" | grep -E '^version:' | awk '{print $2}' || true)"
+            if [ -n "$current_ver" ] && [ -n "$latest_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
+                log_ok "Antigravity Desktop up to date ($current_ver)."
+            elif [ -n "$manifest_data" ] && [ -n "$latest_ver" ]; then
+                log_info "Updating Antigravity Desktop (${current_ver:-none} -> $latest_ver)..."
+                local base_url; base_url="$(echo "$manifest_data" | grep -o 'https://storage.googleapis.com/antigravity-public/antigravity-hub/[^/]*' | head -n 1)"
+                local tmp_w; tmp_w="$(mktemp -d -t antigravity-update-XXXXXX)"
+                if curl -# -fSL -o "$tmp_w/Antigravity.tar.gz" "${base_url}/${arch_dir}/Antigravity.tar.gz" 2>/dev/null; then
+                    mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity.tar.gz" -C "$tmp_w/x"
+                    local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
+                    if [ -f "$pd/antigravity" ]; then
+                        rm -rf "$antigravity_dir"; mkdir -p "$antigravity_dir"; mv "$pd"/* "$antigravity_dir/"
+                        chmod +x "$antigravity_dir/antigravity"; echo "$latest_ver" > "$antigravity_dir/.version"
+                        mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
+                        cat << DESKTOP > "$HOME/.local/share/applications/antigravity.desktop"
+[Desktop Entry]
+Name=Antigravity
+Exec=$antigravity_dir/antigravity --no-sandbox
+Icon=$antigravity_dir/icon.png
+Type=Application
+Terminal=false
+Categories=Development;IDE;
+DESKTOP
+                        cp "$HOME/.local/share/applications/antigravity.desktop" "$HOME/Desktop/" 2>/dev/null || true
+                        chmod +x "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
+                        cat << WRAPPER > "$HOME/.local/bin/antigravity"
+#!/bin/bash
+exec "$antigravity_dir/antigravity" --no-sandbox "\$@"
+WRAPPER
+                        chmod +x "$HOME/.local/bin/antigravity"
+                        log_ok "Antigravity Desktop updated to $latest_ver."
+                    fi
+                fi
+                rm -rf "$tmp_w"
+            fi
+        fi
+    fi
+
+    # 15. Google Antigravity IDE
+    step "Core: Google Antigravity IDE"
+    local antigravity_ide_dir="$HOME/.local/opt/antigravity-ide"
+    if is_antigravity_ide_running; then
+        echo -e "  ${YELLOW}[SKIP] Antigravity IDE is active; skipping update.${RESET}"
+    else
+        local arch_ep=""
+        case "$arch" in x86_64|amd64) arch_ep="linux-x64" ;; aarch64|arm64) arch_ep="linux-arm64" ;;
+            *) log_warn "Unsupported arch for Antigravity IDE: $arch" ;;
+        esac
+        if [ -n "$arch_ep" ]; then
+            local response; response="$(curl -s --max-time 5 \
+                "https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/api/update/${arch_ep}/stable/latest" \
+                2>/dev/null || true)"
+            local download_url; download_url="$(echo "$response" | grep -o '"url":"[^"]*"' | cut -d'"' -f4 || true)"
+            local current_ide=""; [ -f "$antigravity_ide_dir/.version" ] && current_ide="$(cat "$antigravity_ide_dir/.version" 2>/dev/null || true)"
+            local latest_ide=""; [ -n "$download_url" ] && latest_ide="$(echo "$download_url" | sed -E 's|.*/stable/([^/-]+).*|\1|')"
+            if [ -n "$current_ide" ] && [ -n "$latest_ide" ] && [ "$current_ide" = "$latest_ide" ]; then
+                log_ok "Antigravity IDE up to date ($current_ide)."
+            elif [ -n "$download_url" ] && [ -n "$latest_ide" ]; then
+                log_info "Updating Antigravity IDE (${current_ide:-none} -> $latest_ide)..."
+                local tmp_w; tmp_w="$(mktemp -d -t antigravity-ide-update-XXXXXX)"
+                if curl -# -fSL -o "$tmp_w/Antigravity-IDE.tar.gz" "${download_url// /%20}" 2>/dev/null; then
+                    mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity-IDE.tar.gz" -C "$tmp_w/x"
+                    local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
+                    if [ -f "$pd/antigravity-ide" ] || [ -f "$pd/antigravity" ]; then
+                        rm -rf "$antigravity_ide_dir"; mkdir -p "$antigravity_ide_dir"; mv "$pd"/* "$antigravity_ide_dir/"
+                        [ -f "$antigravity_ide_dir/antigravity-ide" ] && chmod +x "$antigravity_ide_dir/antigravity-ide"
+                        [ -f "$antigravity_ide_dir/antigravity" ]     && chmod +x "$antigravity_ide_dir/antigravity"
+                        echo "$latest_ide" > "$antigravity_ide_dir/.version"
+                        [ -f "$antigravity_ide_dir/resources/app/resources/linux/code.png" ] && \
+                            cp "$antigravity_ide_dir/resources/app/resources/linux/code.png" "$antigravity_ide_dir/icon.png"
+                        mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
+                        cat << DESKTOP > "$HOME/.local/share/applications/antigravity-ide.desktop"
+[Desktop Entry]
+Name=Antigravity-IDE
+Exec=$antigravity_ide_dir/antigravity-ide --no-sandbox
+Icon=$antigravity_ide_dir/icon.png
+Type=Application
+Terminal=false
+Categories=Development;IDE;
+DESKTOP
+                        cp "$HOME/.local/share/applications/antigravity-ide.desktop" "$HOME/Desktop/" 2>/dev/null || true
+                        chmod +x "$HOME/Desktop/antigravity-ide.desktop" 2>/dev/null || true
+                        cat << WRAPPER > "$HOME/.local/bin/antigravity-ide"
+#!/bin/bash
+exec "$antigravity_ide_dir/antigravity-ide" --no-sandbox "\$@"
+WRAPPER
+                        chmod +x "$HOME/.local/bin/antigravity-ide"
+                        log_ok "Antigravity IDE updated to $latest_ide."
+                    fi
+                fi
+                rm -rf "$tmp_w"
+            fi
+        fi
+    fi
+
+    # 16. Agy CLI
+    step "Core: Agy CLI"
+    if is_cli_running "agy"; then
+        echo -e "  ${YELLOW}[SKIP] Agy is active; skipping update.${RESET}"
+    elif ! command -v agy &>/dev/null; then
+        log_bootstrap "Installing Agy CLI..."; npm install -g @google/agy 2>/dev/null || true
+    else
+        agy update 2>/dev/null || true; log_ok "Agy CLI up to date."
+    fi
+
+    # 17. Herdr CLI
+    step "Core: Herdr CLI"
+    if is_cli_running "herdr"; then
+        echo -e "  ${YELLOW}[SKIP] Herdr is active; skipping update.${RESET}"
+    elif ! command -v herdr &>/dev/null; then
+        log_bootstrap "Installing Herdr CLI..."; curl -fsSL https://herdr.dev/install.sh | bash 2>/dev/null || true
+    else
+        local cv_h; cv_h="$(herdr --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+        local lv_h; lv_h="$(curl -s --max-time 3 'https://herdr.dev/latest.json' 2>/dev/null | grep -m1 '"version":' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+        if [ -n "$cv_h" ] && [ -n "$lv_h" ] && [ "$cv_h" = "$lv_h" ]; then
+            log_ok "Herdr up to date ($cv_h)."
+        else
+            log_info "Updating Herdr CLI..."; herdr update 2>/dev/null || true
+        fi
+    fi
+
+    # 18. Syncthing
+    step "Core: Syncthing Sync Engine"
+    ! command -v syncthing &>/dev/null && { log_bootstrap "Installing Syncthing..."; sudo dnf install -y syncthing 2>/dev/null || true; }
+    if command -v syncthing &>/dev/null; then
+        local st_configs=( "$HOME/.local/state/syncthing/config.xml" "$HOME/.config/syncthing/config.xml" )
+        local st_cfg=""
+        for c in "${st_configs[@]}"; do [ -f "$c" ] && { st_cfg="$c"; break; }; done
+        if [ -z "$st_cfg" ]; then
+            log_bootstrap "Generating initial Syncthing config..."
+            syncthing generate 2>/dev/null || syncthing --generate 2>/dev/null || true
+            for c in "${st_configs[@]}"; do [ -f "$c" ] && { st_cfg="$c"; break; }; done
+        fi
+        [ -n "$st_cfg" ] && grep -q "<address>127.0.0.1:8384</address>" "$st_cfg" && \
+            sed -i 's|<address>127.0.0.1:8384</address>|<address>0.0.0.0:8384</address>|g' "$st_cfg" && \
+            log_info "Syncthing GUI configured → 0.0.0.0:8384"
+        if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+            sudo firewall-cmd --add-service=syncthing --permanent >/dev/null 2>&1 || true
+            sudo firewall-cmd --add-port=8384/tcp --permanent >/dev/null 2>&1 || true
+            sudo firewall-cmd --reload >/dev/null 2>&1 || true
+        fi
+        systemctl --user is-active --quiet syncthing.service 2>/dev/null || \
+            systemctl --user enable --now syncthing.service 2>/dev/null || true
+        log_ok "Syncthing running, GUI on 0.0.0.0:8384."
+    fi
+}
+
+###############################################################################
+# SECTION: DNF — OS package upgrades, autoremove, cache clean
+###############################################################################
+run_system_dnf() {
+    ! command -v dnf &>/dev/null && { skip_step "DNF" "not found"; return 0; }
+    step "System: Refreshing and upgrading DNF packages"
+    run_or_dry sudo dnf upgrade --refresh -y || log_warn "DNF upgrade had issues, continuing..."
+    step "System: Removing unused DNF dependencies"
+    run_or_dry sudo dnf autoremove -y || log_warn "DNF autoremove had issues, continuing..."
+    step "System: Cleaning DNF package cache"
+    run_or_dry sudo dnf clean packages -y || true
+    log_ok "DNF complete."
+}
+
+###############################################################################
+# SECTION: FLATPAK — update apps + runtimes, prune unused
+###############################################################################
+_check_and_mask_downgraded_flatpaks() {
+    local apps; apps="$(flatpak list --app --columns=application,origin,installation 2>/dev/null || true)"
+    [ -z "$apps" ] && return 0
+    while read -r app origin inst; do
+        [ -z "$app" ] || [ -z "$origin" ] && continue
+        local masked
+        [ "$inst" = "user" ] && masked="$(flatpak mask --user 2>/dev/null || true)" \
+                             || masked="$(flatpak mask 2>/dev/null || true)"
+        local ld rd lts rts
+        ld="$(flatpak info ${inst:+--$inst} "$app" 2>/dev/null | grep -E '^ +Date:' | awk '{print $2, $3}' || true)"
+        rd="$(flatpak remote-info "$origin" "app/$app/$(uname -m)/master" 2>/dev/null | grep -E '^ +Date:' | awk '{print $2, $3}' || true)"
+        [ -z "$ld" ] || [ -z "$rd" ] && continue
+        lts="$(date -d "$ld" +%s 2>/dev/null || echo 0)"; rts="$(date -d "$rd" +%s 2>/dev/null || echo 0)"
+        if echo "$masked" | grep -q "$app"; then
+            [ "$rts" -gt "$lts" ] && { log_info "Newer $app upstream; unmasking...";
+                [ "$inst" = "user" ] && flatpak mask --user --remove "$app" >/dev/null 2>&1 \
+                                     || flatpak mask --remove "$app" >/dev/null 2>&1 || true; }
+            continue
+        fi
+        [ "$lts" -gt "$rts" ] && [ "$rts" -gt 0 ] && { log_info "Remote rollback for $app detected; masking...";
+            [ "$inst" = "user" ] && flatpak mask --user "$app" >/dev/null 2>&1 \
+                                 || flatpak mask "$app" >/dev/null 2>&1 || true; }
+    done <<< "$apps"
+}
+
+run_flatpak() {
+    ! command -v flatpak &>/dev/null && { skip_step "Flatpak" "not found"; return 0; }
+    step "Flatpaks: Updating applications and runtimes"
+    _check_and_mask_downgraded_flatpaks 2>/dev/null || true
+    run_or_dry flatpak update -y || { log_warn "Flatpak update had issues; trying --no-static-deltas..."; run_or_dry flatpak update --no-static-deltas -y || true; }
+    step "Flatpaks: Pruning unused runtimes"
+    run_or_dry flatpak uninstall --unused -y || run_or_dry sudo flatpak uninstall --unused -y || true
+    log_ok "Flatpaks updated."
+}
+
+###############################################################################
+# SECTION: FIRMWARE — LVFS hardware firmware checks
+###############################################################################
+run_firmware() {
+    ! command -v fwupdmgr &>/dev/null && { skip_step "Firmware (LVFS)" "fwupdmgr not found"; return 0; }
+    step "Firmware: Checking LVFS hardware updates"
+    timeout 30s fwupdmgr refresh --no-unreported-check >/dev/null 2>&1 || true
+    timeout 30s fwupdmgr get-updates --no-unreported-check 2>/dev/null \
+        && log_ok "Firmware updates checked." \
+        || { local s=$?; [ "$s" -eq 2 ] && log_ok "All firmware up to date." || log_ok "Firmware check complete."; }
+}
+
+###############################################################################
+# SECTION: AI RUNTIMES — Claude Code, LM Studio, Ollama & installed models
+###############################################################################
+run_ai_runtimes() {
+    # Claude Code
+    if command -v claude &>/dev/null; then
+        step "AI: Claude Code CLI"
+        is_cli_running "claude" \
+            && echo -e "  ${YELLOW}[SKIP] Claude Code is active; skipping update.${RESET}" \
+            || claude update || log_warn "Claude update had issues, continuing..."
+    else skip_step "Claude Code CLI" "not installed"; fi
+
+    # LM Studio
+    if command -v lms &>/dev/null; then
+        step "AI: LM Studio Runtime Extensions"
+        lms runtime update -y --all || log_warn "LM Studio update had issues, continuing..."
+    else skip_step "LM Studio" "not installed"; fi
+
+    # Ollama
+    if command -v ollama &>/dev/null; then
+        step "AI: Ollama Engine & Installed Models"
+        local cv lv
+        cv="$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+        lv="$(curl -s --max-time 3 'https://api.github.com/repos/ollama/ollama/releases/latest' 2>/dev/null | grep -m1 '"tag_name":' | sed -E 's/.*"v?([0-9.]+).*/\1/' || true)"
+        if [ -n "$cv" ] && [ -n "$lv" ] && [ "$cv" = "$lv" ]; then
+            log_ok "Ollama up to date ($cv)."
+        elif [ -n "$lv" ]; then
+            log_info "Upgrading Ollama ($cv -> $lv)..."
+            curl -fsSL https://ollama.com/install.sh | sh || log_warn "Ollama update failed, continuing..."
+        fi
+        local ollama_list
+        if ollama_list="$(ollama list 2>/dev/null)"; then
+            local models; models="$(echo "$ollama_list" | tail -n +2 | awk '{print $1}' | grep -v '^$' || true)"
+            if [ -n "$models" ]; then
+                local model_arr=()
+                while IFS= read -r m; do [ -n "$m" ] && model_arr+=("$m"); done <<< "$models"
+                local total="${#model_arr[@]}"
+                if [ "$total" -eq 0 ]; then
+                    log_ok "No local Ollama models installed."
+                else
+                    local midx=0; log_info "Updating $total installed Ollama models..."
+                    for model in "${model_arr[@]}"; do
+                        ((midx++)); log_substep "$midx" "$total" "Pulling $model..."
+                        ollama pull "$model" || log_warn "Failed to pull '$model', continuing..."
+                    done
+                    log_ok "All Ollama models updated."
+                fi
+            else
+                log_ok "No local Ollama models installed."
+            fi
+        else
+            log_warn "Ollama not running; skipping model updates."
+        fi
+    else skip_step "Ollama Engine" "not installed"; fi
+}
+
+###############################################################################
+# SECTION: DEV TOOLCHAINS — SDKMAN!, gcloud, VS Code, Agent Skills
+###############################################################################
+run_dev_toolchains() {
+    # SDKMAN!
+    if [ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
+        step "Dev: SDKMAN! candidates & framework"
+        ( set +u; source "$HOME/.sdkman/bin/sdkman-init.sh"; sdk selfupdate force >/dev/null 2>&1 || true; sdk update ) \
+            || log_warn "SDKMAN! update had issues, continuing..."
+        log_ok "SDKMAN! updated."
+    else skip_step "SDKMAN!" "not installed"; fi
+
+    # Google Cloud SDK
+    if [ -d "$HOME/google-cloud-sdk" ] && command -v gcloud &>/dev/null; then
+        step "Dev: Google Cloud SDK components"
+        gcloud components update --quiet || log_warn "gcloud update had issues, continuing..."
+        log_ok "Google Cloud SDK updated."
+    else skip_step "Google Cloud SDK" "not installed"; fi
+
+    # VS Code Extensions
+    if command -v code &>/dev/null; then
+        step "Dev: Visual Studio Code extensions"
+        is_vscode_running \
+            && echo -e "  ${YELLOW}[SKIP] VS Code is running; skipping extension updates.${RESET}" \
+            || { code --update-extensions --force || log_warn "VS Code extension update had issues, continuing..."; log_ok "VS Code extensions updated."; }
+    else skip_step "Visual Studio Code" "not installed"; fi
+
+    # Agent Skills
+    if [ -f "$HOME/.agents/.skill-lock.json" ] && command -v npx &>/dev/null; then
+        step "Dev: Agent Skills & Configurations"
+        timeout 60s npx -y skills update --yes || log_warn "Agent skills update had issues, continuing..."
+        log_ok "Agent skills updated."
+    else skip_step "Agent Skills lockfile" "not present"; fi
+}
+
+###############################################################################
+# SECTION: GIT DOCS — sync ~/projects/docs/* and Hermes agent framework
+###############################################################################
+run_git_docs() {
+    step "Git Docs: Synchronizing documentation repos and agent frameworks"
+    local all_repos=()
+    # fedora-update self-update is handled by the 'self' section
+    [ -d "$HOME/.hermes/hermes-agent" ] && all_repos+=("$HOME/.hermes/hermes-agent")
+    all_repos+=( "$HOME/projects/docs/androidx" "$HOME/projects/docs/compose-samples"
+                 "$HOME/projects/docs/horologist" "$HOME/projects/docs/nowinandroid" )
+    local total="${#all_repos[@]}" idx=0
+    for repo in "${all_repos[@]}"; do
+        ((idx++))
+        local rname; rname="$(basename "$repo")"
+        [ "$rname" = "androidx" ] \
+            && log_substep "$idx" "$total" "Checking AndroidX (~55k files)..." \
+            || log_substep "$idx" "$total" "Checking $rname..."
+        if [ -d "$repo" ]; then
+            safe_git_repo_update "$repo"
+            [ "$rname" = "hermes-agent" ] && [ -d "$HOME/.hermes/hermes-agent/venv" ] && {
+                log_action "Updating Hermes editable Python env..."
+                timeout 60s "$HOME/.hermes/hermes-agent/venv/bin/pip" install --upgrade -e "$HOME/.hermes/hermes-agent" 2>/dev/null || true
+            }
+        else
+            skip_step "$rname" "not found"
+        fi
+    done
+    log_ok "All Git repos checked."
+}
+
+###############################################################################
+# SECTION: SELF-UPDATE — keep this suite itself current
+###############################################################################
+run_self_update() {
+    step "Self-Update: Checking fedora-update suite"
+    local repo_path="$HOME/projects/update/fedora-update"
+    if [ ! -d "$repo_path" ]; then log_warn "Repo not found at $repo_path; skipping."; return 0; fi
+    # Safe: all functions are already in memory; updated script takes effect next run
+    safe_git_repo_update "$repo_path"
+    log_ok "fedora-update suite is up to date."
+}
+
+###############################################################################
+# SECTION: CLEANUP — Docker prune, caches, journal vacuum, optional TRIM
+###############################################################################
+run_cleanup() {
+    local do_trim="${1:-false}"
+
+    # Docker
+    if command -v docker &>/dev/null && systemctl is-active --quiet docker 2>/dev/null; then
+        step "Cleanup: Docker images & BuildKit caches"
+        docker image prune -f 2>/dev/null || true
+        if [ "$do_trim" = "true" ]; then
+            docker builder prune -f --reserved-space 5GB 2>/dev/null || docker builder prune -f --keep-storage 5GB 2>/dev/null || true
+            docker image prune -a -f --filter "until=168h" 2>/dev/null || true
+        else
+            docker builder prune -f --reserved-space 15GB 2>/dev/null || docker builder prune -f --keep-storage 15GB 2>/dev/null || true
+        fi
+        log_ok "Docker cache optimized."
+    else
+        skip_step "Docker cleanup" "inactive or not installed"
+    fi
+
+    # PackageKit & dev caches
+    step "Cleanup: PackageKit & development caches"
+    [ -d "/var/cache/PackageKit" ] && sudo rm -rf /var/cache/PackageKit/* 2>/dev/null || true
+    command -v uv &>/dev/null && uv cache prune 2>/dev/null || true
+    python3 -c "import pip" &>/dev/null && python3 -m pip cache purge >/dev/null 2>&1 || true
+    log_ok "Caches pruned."
+
+    # Journal vacuum
+    step "Cleanup: System journal vacuum (14d / 500MB)"
+    sudo journalctl --vacuum-time=14d --vacuum-size=500M 2>&1 | sed 's/^/  /' \
+        || log_warn "Journal vacuum had issues, continuing..."
+    log_ok "System logs vacuumed."
+
+    # Optional SSD TRIM
+    if [ "$do_trim" = "true" ]; then
+        step "Storage: SSD TRIM (fstrim -av)"
+        log_info "(Note: TRIM on large Btrfs pools may take several minutes)"
+        sudo fstrim -av || log_warn "fstrim had issues, continuing..."
+        log_ok "SSD trimmed."
+    fi
+
+    # Reboot check
+    echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}          Checking for Required Service Restarts            ${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+    if command -v dnf &>/dev/null; then
+        if sudo dnf needs-restarting -r >/dev/null 2>&1; then
+            log_ok "No reboot required."
+        else
+            echo -e "\n${BOLD}${RED}╔══════════════════════════════════════════════════════════╗${RESET}"
+            echo -e "${BOLD}${RED}║  ⚠  REBOOT REQUIRED — kernel or core libs updated        ║${RESET}"
+            echo -e "${BOLD}${RED}╚══════════════════════════════════════════════════════════╝${RESET}"
+            echo -e "  Run: ${BOLD}systemctl reboot${RESET}"
+        fi
+        log_info "Services requiring restart:"
+        sudo dnf needs-restarting -s 2>/dev/null | sed 's/^/      /' || true
+    fi
+}
+
+###############################################################################
+# CLI FLAGS & ARGUMENT PARSING
+###############################################################################
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; export DRY_RUN
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Fedora Fleet Maintenance & Toolchain Sync Suite.
+
+Options:
+  --trim           Also perform SSD TRIM (fstrim -av)
+  --only=MODULE    Run only one section: core|dnf|flatpak|firmware|ai|dev|git|self|cleanup
+  --skip=MODULES   Skip sections; comma-separated or repeated
+                   e.g. --skip=dnf,flatpak  or  --skip=dnf --skip=flatpak
+  --dry-run, -n    Preview without making system changes
+  -h, --help       Show this help
+
+Commands:
+  update           Routine maintenance
+  update-all       Routine maintenance + SSD TRIM
+EOF
+    exit 0
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --trim)       DO_TRIM=true; shift ;;
+        --only=*)     ONLY_MODULE="${1#*=}"; shift ;;
+        --skip=*)     IFS=',' read -ra _sk <<< "${1#*=}"; SKIP_MODULES+=("${_sk[@]}"); shift ;;
+        --dry-run|-n) DRY_RUN=true; shift ;;
+        -h|--help)    usage ;;
+        *)            shift ;;
+    esac
+done
+
+should_run() {
+    local k="$1"
+    [ -n "$ONLY_MODULE" ] && [ "$ONLY_MODULE" != "$k" ] && return 1
+    if [ "${#SKIP_MODULES[@]}" -gt 0 ]; then
+        local s; for s in "${SKIP_MODULES[@]}"; do [ "$s" = "$k" ] && return 1; done
+    fi
+    return 0
+}
+
+run_module() {
+    local key="$1" fn="$2"; shift 2
+    should_run "$key" || return 0
+    local t0 t1; t0=$(date +%s); "$fn" "$@"; t1=$(date +%s)
+    echo -e "  ${CYAN}[${key} time: $((t1 - t0))s]${RESET}"
+}
+
+###############################################################################
+# MAIN
+###############################################################################
+main() {
+    init_logging
+    local START_TIME; START_TIME=$(date +%s)
+
+    [ "$DRY_RUN" = "true" ] && echo -e "${BOLD}${YELLOW}============================================================\n   DRY-RUN MODE — No system changes will be made\n============================================================${RESET}\n"
+
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}          Starting Fedora Fleet Maintenance Suite           ${RESET}"
+    echo -e "${BOLD}${CYAN}  Log: $LOG_FILE${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}\n"
+
+    # Self-register symlinks on first run / after Syncthing sync to a new node
+    chmod +x "$SCRIPT_DIR/update" "$SCRIPT_DIR/update-all" "$SCRIPT_DIR/install.sh" 2>/dev/null || true
+    mkdir -p "$HOME/.local/bin"
+    [ "$(readlink -f "$HOME/.local/bin/update" 2>/dev/null)" != "$SCRIPT_DIR/update" ] && \
+        ln -sf "$SCRIPT_DIR/update" "$HOME/.local/bin/update" 2>/dev/null || true
+    [ "$(readlink -f "$HOME/.local/bin/update-all" 2>/dev/null)" != "$SCRIPT_DIR/update-all" ] && \
+        ln -sf "$SCRIPT_DIR/update-all" "$HOME/.local/bin/update-all" 2>/dev/null || true
+
+    ensure_passwordless_sudo
+
+    TOTAL_STEPS=0
+    should_run "core"     && TOTAL_STEPS=$((TOTAL_STEPS + 18))
+    should_run "dnf"      && TOTAL_STEPS=$((TOTAL_STEPS + 3))
+    should_run "flatpak"  && TOTAL_STEPS=$((TOTAL_STEPS + 2))
+    should_run "firmware" && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    should_run "ai"       && TOTAL_STEPS=$((TOTAL_STEPS + 3))
+    should_run "dev"      && TOTAL_STEPS=$((TOTAL_STEPS + 4))
+    should_run "git"      && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    should_run "self"     && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    should_run "cleanup"  && {
+        [ "$DO_TRIM" = "true" ] && TOTAL_STEPS=$((TOTAL_STEPS + 4)) || TOTAL_STEPS=$((TOTAL_STEPS + 3))
+    }
+
+    run_module "core"     run_core_baseline
+    run_module "dnf"      run_system_dnf
+    run_module "flatpak"  run_flatpak
+    run_module "firmware" run_firmware
+    run_module "ai"       run_ai_runtimes
+    run_module "dev"      run_dev_toolchains
+    run_module "git"      run_git_docs
+    run_module "self"     run_self_update
+    run_module "cleanup"  run_cleanup "$DO_TRIM"
+
+    local END_TIME DURATION
+    END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
+
+    echo -e "\n${BOLD}${GREEN}============================================================${RESET}"
+    echo -e "${BOLD}${GREEN}  --- Update complete in ${DURATION}s! ---${RESET}"
+    echo -e "${CYAN}  Log: ${LOG_FILE}${RESET}"
+    echo -e "${BOLD}${GREEN}============================================================${RESET}\n"
+
+    command -v notify-send &>/dev/null && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && \
+        notify-send --icon=software-update-available --urgency=normal \
+            "Fedora Update Complete" "Done in ${DURATION}s. Log: $LOG_FILE" 2>/dev/null || true
+}
+
+main "$@"
