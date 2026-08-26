@@ -3,7 +3,7 @@
 > **Repository:** [fedora-update](file:///home/jay/projects/update/fedora-update)  
 > **Target OS:** Fedora Linux (Workstation, Development, VM, Personal)  
 > **Sync Layer:** [Syncthing](https://syncthing.net/) (Syncs `~/.gemini` and `~/projects/`)  
-> **Primary Executables:** [`update`](file:///home/jay/projects/update/fedora-update/update), [`update-all`](file:///home/jay/projects/update/fedora-update/update-all), [`bin/fedora-update`](file:///home/jay/projects/update/fedora-update/bin/fedora-update)
+> **Primary Executables:** [`update`](file:///home/jay/projects/update/fedora-update/update), [`update-all`](file:///home/jay/projects/update/fedora-update/update-all)
 
 ---
 
@@ -47,26 +47,14 @@ graph TD
 
 ```
 fedora-update/
-├── AGENTS.md                   # Agent specifications & architectural manual
-├── README.md                   # User documentation & quickstart
-├── update                      # Top-level 1-click routine maintenance runner
-├── update-all                  # Top-level 1-click maintenance + SSD TRIM runner
-├── bin/
-│   └── fedora-update           # Unified engine runner (supports --trim, --only=, --skip=)
-├── lib/
-│   ├── common.sh               # Terminal formatting, logging to ~/.local/state/update/, passwordless sudo setup
-│   ├── process.sh              # Active process & agent busy detection (skip if busy, update if idle)
-│   └── git_guard.sh            # Syncthing-safe Git dirty-tree checks for ~/projects/
-└── modules/
-    ├── 00_core_baseline.sh     # Core Fleet Baseline: installs if missing + updates
-    ├── 01_system_dnf.sh        # DNF upgrade, autoremove, clean
-    ├── 02_flatpak.sh           # Flatpak update + static-delta fallback + unused runtime prune
-    ├── 03_firmware.sh          # LVFS hardware firmware checks (fwupdmgr)
-    ├── 04_ai_runtimes.sh       # Claude Code, LM Studio, Ollama & installed models
-    ├── 05_dev_toolchains.sh    # SDKMAN!, gcloud, VS Code extensions, Agent skills
-    ├── 06_git_docs.sh          # Safe git pull/rebase on ~/projects/docs and Hermes
-    └── 07_cleanup.sh           # Docker image prune, journalctl vacuum, optional fstrim
+├── update       # All logic lives here: ~970 lines, clearly sectioned
+├── update-all   # 4-line wrapper: exec update --trim
+├── install.sh   # First-time symlink + Syncthing bootstrap
+├── AGENTS.md    # Agent operating manual
+└── README.md    # User documentation & quickstart
 ```
+
+Everything is in one file. To add a new tool: open `update`, find the right `### SECTION` block, add a step. No sourcing, no module loading order, no extra files.
 
 ---
 
@@ -151,7 +139,7 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 2.1.0 (Modular Engine + Serial Timing)
+- **Current Version:** 3.0.0 (Single-File Architecture)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
@@ -177,3 +165,12 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 - High-visibility reboot-required banner (red box) replaces the previous low-contrast `[!]` warning in `07_cleanup.sh`.
 - `tauri-cli` version check added before slow `cargo install --locked` to avoid unnecessary recompilation when already current.
 - `install.sh` warns if `~/.local/bin` is not in `$PATH` after symlinking.
+
+### v3.0.0 (2026-08-25)
+
+**Architecture: Consolidated to Single-File**
+- Removed `bin/`, `lib/`, and `modules/` directories entirely (13 files deleted).
+- All logic consolidated into a single `update` script (~970 lines, clearly sectioned with `### SECTION:` headers).
+- `update-all` is now a 4-line wrapper (`exec update --trim "$@"`).
+- `install.sh` updated to only reference `update` and `update-all`.
+- Result: `grep -n "tool_name" update` finds anything instantly. Adding a new tool is adding a block, not touching multiple files.

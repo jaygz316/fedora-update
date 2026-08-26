@@ -1,136 +1,70 @@
-# Fedora Update (`fedora-update`)
+# fedora-update
 
-A robust, 1-click multi-node system maintenance and toolchain synchronization suite tailored for **Fedora Linux** power users, developers, and multi-machine fleets.
+A single-file, 1-click maintenance and toolchain sync suite for a fleet of Fedora machines.
 
-Designed to keep 3 to 5 heterogeneous Fedora machines (development workstations, personal machines, lightweight VMs) synchronized and up to date without manual friction.
+## How It Works
 
----
+Everything lives in **one script** — [`update`](./update). There's nothing to source, no module directories, no loading order to debug. Add a new tool? Open `update`, find the right section, add a block.
 
-## ⚡ Key Highlights
+The project is synced across all machines via **Syncthing** (`~/projects/` and `~/.gemini`).
 
-- **1-Click Fleet Experience**: Run `update` or `update-all` on any Fedora machine. No manual profile management required.
-- **Core Fleet Baseline**: Automatically bootstraps and keeps updated all essential toolchains on any machine (even a fresh minimal VM):
-  - **AI Ecosystem**: Google Antigravity Desktop, Google Antigravity IDE, Agy CLI (`agy`), Herdr CLI (`herdr`).
-  - **Development Languages**: Rust (`rustup`), Bun (`bun`), Go + `gopls`/`dlv`, Astral `uv`, Python `pip`.
-  - **Containers & Sync**: Docker Engine & Compose, Syncthing (with Web GUI configured on `0.0.0.0:8384` and systemd service enabled).
-  - **Android Toolchains**: Android SDK / CLI (`android`), Android Studio Latest Preview.
-  - **Utilities & Package Managers**: Micro editor, GitHub CLI (`gh`), safe NPM user prefix (`~/.npm-global`), C/C++ build tools (`gcc`, `make`).
-  - **Python CLI Tools**: `esptool`, `meshtastic`, `openai-whisper`, `google-antigravity`, `google-genai`, `mcp`, `rich-click`, `tabulate`, `pyinstaller`, `uvicorn`, `websockets`, `setuptools`.
-- **Dynamic Installed-Only Updates**: If present on the host, automatically updates:
-  - DNF packages & repositories (`upgrade --refresh`, `autoremove`, `clean packages`).
-  - Flatpaks & runtimes (with delta decompression fallback and unused runtime pruning).
-  - Hardware & system firmware via LVFS (`fwupdmgr`).
-  - Secondary AI tools (Claude Code, LM Studio, Ollama engine & locally installed models).
-  - SDKMAN! candidates, Google Cloud SDK (`gcloud`), VS Code extensions, Micro plugins, Agent skills.
-  - Git documentation repositories (`~/projects/docs/*`, `~/.hermes/hermes-agent`).
-- **Active Agent & App Protection**: Checks if an AI agent, IDE, or app is actively working. If busy, cleanly skips updating that component to prevent crashing your session.
-- **Syncthing & Concurrency Safe**: Protects Git repos in synced folders (`~/projects/`) from dirty-tree rebase conflicts.
-- **Automated Passwordless Sudo & Polkit**: Verifies sudo and Polkit permissions on launch and configures `/etc/sudoers.d/$USER` and `/etc/polkit-1/rules.d/` for promptless 1-click execution.
-- **Post-Update Intelligence**: Checks for required kernel/glibc reboots (`dnf needs-restarting -r`) and active services requiring restart (`dnf needs-restarting -s`).
+## Quickstart
 
----
+```bash
+# Clone to a new Fedora machine (before Syncthing is running)
+git clone https://github.com/jaygz316/fedora-update ~/projects/update/fedora-update
+bash ~/projects/update/fedora-update/install.sh
 
-## 📦 Scripts & Architecture
+# Then just run:
+update
+```
+
+## Usage
+
+```bash
+update              # Full run: core → dnf → flatpak → firmware → ai → dev → git → self → cleanup
+update-all          # Same + SSD TRIM (fstrim -av)
+```
+
+### Options
+
+```bash
+update --dry-run                   # Preview all steps, no system changes
+update --only=core                 # Run only one section
+update --skip=dnf,flatpak          # Skip sections (comma-separated)
+update --skip=dnf --skip=flatpak   # Skip sections (repeated flag)
+update --trim                      # Include SSD TRIM step
+```
+
+### Section Keys (for `--only=` / `--skip=`)
+
+| Key       | What it does |
+| :-------- | :--- |
+| `core`    | Installs/updates all baseline tools on every node (pip, uv, Rust, Bun, Go, Docker, Android SDK, Antigravity, Agy, Herdr, Syncthing) |
+| `dnf`     | DNF system upgrade, autoremove, cache clean |
+| `flatpak` | Flatpak app + runtime updates, prune unused |
+| `firmware`| LVFS hardware firmware checks (fwupdmgr) |
+| `ai`      | Claude Code, LM Studio, Ollama + installed models |
+| `dev`     | SDKMAN!, gcloud, VS Code extensions, Agent Skills |
+| `git`     | git pull on docs repos and Hermes agent framework |
+| `self`    | git pull on this fedora-update repo itself |
+| `cleanup` | Docker prune, caches, journal vacuum, reboot check |
+
+## Files
 
 ```
 fedora-update/
-├── install.sh                  # 1-step installer & Syncthing bootstrapper for new nodes
-├── update                      # Top-level 1-click routine maintenance runner
-├── update-all                  # Top-level 1-click maintenance + SSD TRIM runner
-├── bin/
-│   └── fedora-update           # Unified modular engine (supports --trim, --only=, --skip=)
-├── lib/
-│   ├── common.sh               # Colors, logging, dynamic steps, passwordless sudo & polkit setup
-│   ├── process.sh              # Active process & agent busy detection
-│   └── git_guard.sh            # Syncthing-safe Git dirty-tree checks
-└── modules/
-    ├── 00_core_baseline.sh     # Core Fleet Baseline installer & updater (includes Syncthing 0.0.0.0)
-    ├── 01_system_dnf.sh        # DNF upgrade, autoremove, clean
-    ├── 02_flatpak.sh           # Flatpak updates + static-delta fallback + unused cleanup
-    ├── 03_firmware.sh          # LVFS firmware updates
-    ├── 04_ai_runtimes.sh       # Claude Code, LM Studio, Ollama & installed models
-    ├── 05_dev_toolchains.sh    # SDKMAN!, gcloud, VS Code extensions, Agent skills
-    ├── 06_git_docs.sh          # Local Git doc repos & Hermes framework
-    └── 07_cleanup.sh           # Docker image prune, journalctl vacuum, optional fstrim
+├── update      ← everything is here (~970 lines, well-sectioned)
+├── update-all  ← 4-line wrapper: exec update --trim
+├── install.sh  ← first-time symlink + Syncthing bootstrap
+├── AGENTS.md   ← agent operating manual
+└── README.md
 ```
 
----
+## Adding a New Tool
 
-## 🚀 Setting Up a New Computer
+Open [`update`](./update), find the appropriate `### SECTION` block (or add one), and add your steps there. No sourcing, no module files, no loading order. `grep -n "tool_name" update` finds anything instantly.
 
-### Scenario A: Syncthing is Already Connected (Standard Flow)
-Because Syncthing automatically replicates `~/projects/` across all your nodes, the repository will already exist on your new computer at `~/projects/update/fedora-update`.
+## Logs
 
-1. Run the 1-step installer:
-   ```bash
-   ~/projects/update/fedora-update/install.sh
-   ```
-   *(Or simply run `~/projects/update/fedora-update/update` once—it will self-register the symlinks into `~/.local/bin/` automatically!)*
-
-2. From then on, simply type:
-   ```bash
-   update
-   ```
-
----
-
-### Scenario B: Brand New Computer (Before Syncthing is Set Up)
-If setting up a fresh Fedora installation or a clean VM before Syncthing has synced:
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/jaygz316/fedora-update.git ~/projects/update/fedora-update
-   ```
-
-2. **Run the 1-step installer:**
-   ```bash
-   ~/projects/update/fedora-update/install.sh
-   ```
-   *This automatically registers `update` in `~/.local/bin`, installs **Syncthing**, configures its Web UI to listen on `0.0.0.0:8384` across your LAN, and activates its systemd user service.*
-
-3. **Run your first update:**
-   ```bash
-   update
-   ```
-   *The first run will prompt for your sudo password once to configure passwordless sudo & Polkit, then bootstrap all Core Fleet Baseline tools (compilers, Docker, Android SDK/Studio, Antigravity Desktop/IDE, uv, pip, Python CLI tools).*
-
----
-
-## 🛠️ Usage
-
-- **Routine Daily Maintenance:**
-  ```bash
-  update
-  ```
-
-- **Deep Maintenance (Including SSD TRIM):**
-  ```bash
-  update-all
-  ```
-
-- **Preview Only (Dry Run — no system changes made):**
-  ```bash
-  fedora-update --dry-run
-  fedora-update --dry-run --only=dnf
-  ```
-
-- **Targeted Single Module Update:**
-  ```bash
-  fedora-update --only=core
-  fedora-update --only=dnf
-  fedora-update --only=flatpak
-  fedora-update --only=firmware
-  fedora-update --only=ai
-  fedora-update --only=dev
-  fedora-update --only=git
-  fedora-update --only=self
-  fedora-update --only=cleanup
-  ```
-
-- **Skip One or More Modules (comma-separated or repeated flags):**
-  ```bash
-  fedora-update --skip=dnf,flatpak
-  fedora-update --skip=firmware --skip=ai
-  ```
-
-Logs are preserved in `~/.local/state/update/last-update.log` and archived chronologically (retaining the last 10 runs).
+Every run is saved to `~/.local/state/update/last-update.log` and archived as `update_YYYYMMDD_HHMMSS.log` (last 10 kept).
