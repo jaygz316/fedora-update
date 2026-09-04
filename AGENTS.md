@@ -139,7 +139,7 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 3.0.0 (Single-File Architecture)
+- **Current Version:** 3.1.0 (Performance & Concurrency Optimization)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
@@ -174,3 +174,14 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 - `update-all` is now a 4-line wrapper (`exec update --trim "$@"`).
 - `install.sh` updated to only reference `update` and `update-all`.
 - Result: `grep -n "tool_name" update` finds anything instantly. Adding a new tool is adding a block, not touching multiple files.
+
+### v3.1.0 (2026-09-03)
+
+**Performance & Concurrency Optimizations**
+- **DNF Parallel Downloads & Single Pass:** Auto-configures `max_parallel_downloads=10` in `/etc/dnf/dnf.conf` across fleet nodes. Merged `makecache --refresh` into `dnf upgrade --refresh -y` in a single pass to eliminate redundant DNF process and repo loading overhead.
+- **Fixed Ollama False Upgrade Loop:** Corrected release tag regex extraction from GitHub's single-line minified JSON (`tag_name`), fixing a bug where `lv` evaluated to `2026`, causing the Ollama engine installer to re-download on every run.
+- **Parallel Git Documentation Sync:** Concurrent `git fetch` and dirty check across all documentation repositories (`androidx`, `compose-samples`, `horologist`, `nowinandroid`, `hermes-agent`) using isolated buffered subshells, reducing sync time from 20s+ to ~2s without log interleaving.
+- **Fast-Path Global NPM Updates:** Added `npm outdated -g --json` pre-check (~700ms) before `npm update -g` (6s+) to skip full package tree writes when all global packages are current.
+- **Claude Code Deduplication:** Skips redundant `claude update` network call if Claude is installed under `~/.npm-global` and was already verified in the NPM step.
+- **UV Tool Caching & Force Flag:** Cached `uv tool list` before the missing tools loop and added `--force` to `uv tool install` so legacy pip wrappers are replaced and successfully registered with `uv`. Removed duplicate `uv cache prune` from Core Baseline.
+- **Clean Needs-Restarting Output:** Passed `-q` to `sudo dnf needs-restarting` to eliminate repo loading chatter, and gracefully report when zero services require restarting.

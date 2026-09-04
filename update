@@ -40,10 +40,20 @@ export PYTHONUNBUFFERED=1 GIT_TERMINAL_PROMPT=0 FORCE_COLOR=1 CLICOLOR_FORCE=1
 ###############################################################################
 # STEP COUNTER & LOGGING HELPERS
 ###############################################################################
-STEP_COUNT=0; TOTAL_STEPS=0
+STEP_COUNT=0; TOTAL_STEPS=0; _SUDO_KEEPALIVE_PID=""; _STEP_START_TIME=0
+
+format_duration() {
+    local s="$1"
+    if [ "$s" -ge 60 ]; then
+        echo "$((s / 60))m $((s % 60))s"
+    else
+        echo "${s}s"
+    fi
+}
 
 step() {
     STEP_COUNT=$((STEP_COUNT + 1))
+    _STEP_START_TIME=$(date +%s)
     [ "$TOTAL_STEPS" -gt 0 ] \
         && echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}/${TOTAL_STEPS}] $1...${RESET}" \
         || echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}] $1...${RESET}"
@@ -58,7 +68,18 @@ skip_step() {
 log_substep()  { echo -e "  ${BOLD}${CYAN}--> [$1/$2]${RESET} $3"; }
 log_action()   { echo -e "  ${CYAN}... $1${RESET}"; }
 log_info()     { echo -e "  ${BOLD}[*] $1${RESET}"; }
-log_ok()       { echo -e "  ${GREEN}[OK] $1${RESET}"; }
+log_ok()       {
+    if [ "$_STEP_START_TIME" -gt 0 ]; then
+        local elapsed=$(( $(date +%s) - _STEP_START_TIME ))
+        if [ "$elapsed" -ge 3 ]; then
+            echo -e "  ${GREEN}[OK] $1 ${CYAN}(took $(format_duration "$elapsed"))${RESET}"
+            _STEP_START_TIME=0
+            return
+        fi
+    fi
+    echo -e "  ${GREEN}[OK] $1${RESET}"
+    _STEP_START_TIME=0
+}
 log_warn()     { echo -e "  ${YELLOW}^ WARNING: $1${RESET}"; }
 log_err()      { echo -e "  ${RED}^ ERROR: $1${RESET}"; }
 log_bootstrap(){ echo -e "  ${BOLD}${MAGENTA}--> [BOOTSTRAP] $1${RESET}"; }
@@ -128,8 +149,8 @@ EOF
     # Keep sudo ticket alive for the duration of the run
     if sudo -n true 2>/dev/null; then
         while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
-        local _sudo_pid=$!
-        trap 'kill "$_sudo_pid" 2>/dev/null || true' EXIT
+        _SUDO_KEEPALIVE_PID=$!
+        trap '[ -n "$_SUDO_KEEPALIVE_PID" ] && kill "$_SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
     fi
 }
 
@@ -207,6 +228,7 @@ safe_git_repo_update() {
         if [ -n "$local_c" ] && [ -n "$upstream_c" ] && [ "$local_c" = "$upstream_c" ]; then
             log_ok "$repo_name is already up to date."
         else
+            log_info "Pulling upstream changes into $repo_name..."
             timeout 60s git pull --rebase --autostash \
                 && log_ok "$repo_name synchronized." \
                 || log_warn "Pull/rebase failed for $repo_name."
@@ -281,8 +303,15 @@ run_core_baseline() {
             mkdir -p "$HOME/.npm-global/bin" "$HOME/.npm-global/lib"
             npm config set prefix "$HOME/.npm-global"; export PATH="$HOME/.npm-global/bin:$PATH"
         fi
-        npm update -g 2>/dev/null || true
-        log_ok "NPM global config synced."
+        local npm_outdated; npm_outdated="$(npm outdated -g --json 2>/dev/null || true)"
+        if [ -n "$npm_outdated" ] && [ "$npm_outdated" != "{}" ]; then
+            log_action "Updating outdated global NPM packages..."
+            npm update -g 2>/dev/null || true
+            log_ok "NPM global packages updated."
+        else
+            log_ok "NPM global config synced (all packages current)."
+        fi
+        _NPM_GLOBAL_SYNCED=true
     fi
 
     # 5. Python CLI Tools (uv tool / pip)
@@ -291,15 +320,27 @@ run_core_baseline() {
     local user_libs=( google-antigravity google-genai setuptools )
     local total_tools="${#cli_tools[@]}" tidx=0
     if command -v uv &>/dev/null; then
+        log_action "Checking and upgrading uv-managed CLI tools..."
         uv tool upgrade --all 2>/dev/null || true
+        local installed_tools; installed_tools="$(uv tool list --color never 2>/dev/null || true)"
         for tool in "${cli_tools[@]}"; do
-            ((tidx++)); log_substep "$tidx" "$total_tools" "Verifying $tool..."
-            uv tool install --upgrade "$tool" 2>/dev/null || true
+            ((tidx++))
+            if ! echo "$installed_tools" | grep -q "^$tool "; then
+                log_substep "$tidx" "$total_tools" "Installing missing $tool via uv..."
+                uv tool install --force "$tool" 2>/dev/null || true
+            fi
         done
-        python3 -m pip install --user --upgrade "${user_libs[@]}" 2>/dev/null || true
-        uv cache prune 2>/dev/null || true
+        log_action "Verifying user Python libraries (${user_libs[*]})..."
+        python3 -m pip install --user --upgrade "${user_libs[@]}" 2>&1 | while IFS= read -r pline; do
+            case "$pline" in
+                *"Successfully installed"*|*"Downloading"*)
+                    echo -e "  ${CYAN}--> $pline${RESET}" ;;
+                *) ;;
+            esac
+        done
         log_ok "Python CLI utilities synchronized."
     elif python3 -c "import pip" &>/dev/null; then
+        log_action "Checking Python CLI tools via pip..."
         for tool in "${cli_tools[@]}" "${user_libs[@]}"; do
             ((tidx++)); log_substep "$tidx" "$((total_tools + ${#user_libs[@]}))" "Verifying $tool..."
             python3 -m pip install --user --upgrade "$tool" 2>/dev/null || true
@@ -458,9 +499,11 @@ WRAPPER
                 log_ok "Antigravity Desktop up to date ($current_ver)."
             elif [ -n "$manifest_data" ] && [ -n "$latest_ver" ]; then
                 log_info "Updating Antigravity Desktop (${current_ver:-none} -> $latest_ver)..."
+                log_action "Downloading Antigravity Desktop archive ($latest_ver)..."
                 local base_url; base_url="$(echo "$manifest_data" | grep -o 'https://storage.googleapis.com/antigravity-public/antigravity-hub/[^/]*' | head -n 1)"
                 local tmp_w; tmp_w="$(mktemp -d -t antigravity-update-XXXXXX)"
                 if curl -# -fSL -o "$tmp_w/Antigravity.tar.gz" "${base_url}/${arch_dir}/Antigravity.tar.gz" 2>/dev/null; then
+                    log_action "Extracting and installing to $antigravity_dir..."
                     mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity.tar.gz" -C "$tmp_w/x"
                     local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
                     if [ -f "$pd/antigravity" ]; then
@@ -512,8 +555,10 @@ WRAPPER
                 log_ok "Antigravity IDE up to date ($current_ide)."
             elif [ -n "$download_url" ] && [ -n "$latest_ide" ]; then
                 log_info "Updating Antigravity IDE (${current_ide:-none} -> $latest_ide)..."
+                log_action "Downloading Antigravity IDE archive ($latest_ide)..."
                 local tmp_w; tmp_w="$(mktemp -d -t antigravity-ide-update-XXXXXX)"
                 if curl -# -fSL -o "$tmp_w/Antigravity-IDE.tar.gz" "${download_url// /%20}" 2>/dev/null; then
+                    log_action "Extracting and installing to $antigravity_ide_dir..."
                     mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity-IDE.tar.gz" -C "$tmp_w/x"
                     local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
                     if [ -f "$pd/antigravity-ide" ] || [ -f "$pd/antigravity" ]; then
@@ -605,10 +650,45 @@ WRAPPER
 ###############################################################################
 run_system_dnf() {
     ! command -v dnf &>/dev/null && { skip_step "DNF" "not found"; return 0; }
+
+    # Ensure max_parallel_downloads is active across fleet nodes (default is only 3)
+    if [ -f /etc/dnf/dnf.conf ] && ! grep -q "^max_parallel_downloads" /etc/dnf/dnf.conf 2>/dev/null; then
+        sudo sed -i '/^\[main\]/a max_parallel_downloads=10' /etc/dnf/dnf.conf 2>/dev/null || true
+    fi
+
     step "System: Refreshing and upgrading DNF packages"
-    run_or_dry sudo dnf upgrade --refresh -y || log_warn "DNF upgrade had issues, continuing..."
+    local pkgs_changed=false
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        run_or_dry sudo dnf upgrade --refresh -y
+    else
+        log_action "Refreshing metadata & resolving updates in a single pass..."
+        sudo dnf upgrade --refresh -y 2>&1 | while IFS= read -r line; do
+            case "$line" in
+                *"Upgrading:"*|*"Installing:"*|*"Removing:"*|*"Replacing:"*|*"Replaced:"*)
+                    pkgs_changed=true
+                    echo -e "  ${CYAN}$line${RESET}" ;;
+                *"Total download size"*|*"Downloading Packages"*)
+                    echo -e "  ${BOLD}$line${RESET}" ;;
+                *"Running transaction"*)
+                    log_action "Applying package updates (this may take several minutes if kernel/drivers update)..." ;;
+                *"Preparing"*)
+                    echo -e "  ${CYAN}... $line${RESET}" ;;
+                *"Upgrading "*|*"Installing "*|*"Cleanup "*|*"Reinstalling "*)
+                    echo -e "  ${CYAN}-->${RESET} $line" ;;
+                *"Running scriptlet"*|*"akmods"*|*"dracut"*)
+                    echo -e "  ${YELLOW}--> [system hook] $line${RESET}" ;;
+                *"Nothing to do"*|*"Dependencies resolved"*)
+                    echo -e "  ${GREEN}$line${RESET}" ;;
+                *"Complete!"*)
+                    echo -e "  ${GREEN}$line${RESET}" ;;
+                *) ;; # suppress uninformative internal lines
+            esac
+        done
+        local dnf_rc=${PIPESTATUS[0]}
+        [ "$dnf_rc" -ne 0 ] && log_warn "DNF upgrade had issues (exit $dnf_rc), continuing..."
+    fi
     step "System: Removing unused DNF dependencies"
-    run_or_dry sudo dnf autoremove -y || log_warn "DNF autoremove had issues, continuing..."
+    run_or_dry sudo dnf autoremove -y 2>&1 | grep -E "(Removing:|Freed space|Nothing to do|Complete)" | sed 's/^/  /' || log_warn "DNF autoremove had issues, continuing..."
     step "System: Cleaning DNF package cache"
     run_or_dry sudo dnf clean packages -y || true
     log_ok "DNF complete."
@@ -644,11 +724,33 @@ _check_and_mask_downgraded_flatpaks() {
 
 run_flatpak() {
     ! command -v flatpak &>/dev/null && { skip_step "Flatpak" "not found"; return 0; }
+    
+    # 1. Prune unused FIRST to prevent downloading 100s of MBs of updates for runtimes about to be deleted
+    step "Flatpaks: Pruning unused runtimes (pre-update cleanup)"
+    log_action "Checking for obsolete or unused Flatpak runtimes..."
+    local pruned_out
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        run_or_dry flatpak uninstall --unused -y
+    else
+        pruned_out="$(flatpak uninstall --unused -y 2>&1 || true)"
+        if echo "$pruned_out" | grep -q "Uninstall complete"; then
+            local count; count="$(echo "$pruned_out" | grep -c "Uninstalling" || true)"
+            log_ok "Pruned $count unused runtime(s) before download."
+        else
+            log_ok "No unused Flatpak runtimes found."
+        fi
+    fi
+
+    # 2. Update remaining applications and runtimes
     step "Flatpaks: Updating applications and runtimes"
     _check_and_mask_downgraded_flatpaks 2>/dev/null || true
+    log_action "Checking remotes for application and runtime updates..."
     run_or_dry flatpak update -y || { log_warn "Flatpak update had issues; trying --no-static-deltas..."; run_or_dry flatpak update --no-static-deltas -y || true; }
-    step "Flatpaks: Pruning unused runtimes"
-    run_or_dry flatpak uninstall --unused -y || run_or_dry sudo flatpak uninstall --unused -y || true
+    
+    # Quick sweep if an application upgrade left an older runtime orphaned
+    if [ "${DRY_RUN:-false}" != "true" ]; then
+        flatpak uninstall --unused -y >/dev/null 2>&1 || true
+    fi
     log_ok "Flatpaks updated."
 }
 
@@ -658,6 +760,7 @@ run_flatpak() {
 run_firmware() {
     ! command -v fwupdmgr &>/dev/null && { skip_step "Firmware (LVFS)" "fwupdmgr not found"; return 0; }
     step "Firmware: Checking LVFS hardware updates"
+    log_action "Checking LVFS metadata for device firmware updates..."
     timeout 30s fwupdmgr refresh --no-unreported-check >/dev/null 2>&1 || true
     timeout 30s fwupdmgr get-updates --no-unreported-check 2>/dev/null \
         && log_ok "Firmware updates checked." \
@@ -671,14 +774,20 @@ run_ai_runtimes() {
     # Claude Code
     if command -v claude &>/dev/null; then
         step "AI: Claude Code CLI"
-        is_cli_running "claude" \
-            && echo -e "  ${YELLOW}[SKIP] Claude Code is active; skipping update.${RESET}" \
-            || claude update || log_warn "Claude update had issues, continuing..."
+        if is_cli_running "claude"; then
+            echo -e "  ${YELLOW}[SKIP] Claude Code is active; skipping update.${RESET}"
+        elif [ "${_NPM_GLOBAL_SYNCED:-false}" = "true" ] && [[ "$(command -v claude 2>/dev/null || true)" == *".npm-global"* ]]; then
+            log_ok "Claude Code verified (synced via NPM global)."
+        else
+            log_action "Checking Claude Code version..."
+            claude update || log_warn "Claude update had issues, continuing..."
+        fi
     else skip_step "Claude Code CLI" "not installed"; fi
 
     # LM Studio
     if command -v lms &>/dev/null; then
         step "AI: LM Studio Runtime Extensions"
+        log_action "Checking LM Studio runtimes..."
         lms runtime update -y --all || log_warn "LM Studio update had issues, continuing..."
     else skip_step "LM Studio" "not installed"; fi
 
@@ -687,12 +796,19 @@ run_ai_runtimes() {
         step "AI: Ollama Engine & Installed Models"
         local cv lv
         cv="$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
-        lv="$(curl -s --max-time 3 'https://api.github.com/repos/ollama/ollama/releases/latest' 2>/dev/null | grep -m1 '"tag_name":' | sed -E 's/.*"v?([0-9.]+).*/\1/' || true)"
+        log_action "Checking Ollama version (current: ${cv:-unknown})..."
+        lv="$(curl -s --max-time 4 'https://api.github.com/repos/ollama/ollama/releases/latest' 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
         if [ -n "$cv" ] && [ -n "$lv" ] && [ "$cv" = "$lv" ]; then
             log_ok "Ollama up to date ($cv)."
         elif [ -n "$lv" ]; then
-            log_info "Upgrading Ollama ($cv -> $lv)..."
-            curl -fsSL https://ollama.com/install.sh | sh || log_warn "Ollama update failed, continuing..."
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+                log_info "[DRY-RUN] Would upgrade Ollama ($cv -> $lv)"
+            else
+                log_info "Upgrading Ollama ($cv -> $lv, downloading installer bundle)..."
+                curl -fsSL https://ollama.com/install.sh | sh || log_warn "Ollama update failed, continuing..."
+                log_action "Waiting for Ollama daemon to initialize..."
+                for _i in {1..10}; do ollama list &>/dev/null && break || sleep 1; done
+            fi
         fi
         local ollama_list
         if ollama_list="$(ollama list 2>/dev/null)"; then
@@ -727,6 +843,7 @@ run_dev_toolchains() {
     # SDKMAN!
     if [ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]; then
         step "Dev: SDKMAN! candidates & framework"
+        log_action "Checking SDKMAN! candidates & framework..."
         ( set +u; source "$HOME/.sdkman/bin/sdkman-init.sh"; sdk selfupdate force >/dev/null 2>&1 || true; sdk update ) \
             || log_warn "SDKMAN! update had issues, continuing..."
         log_ok "SDKMAN! updated."
@@ -735,6 +852,7 @@ run_dev_toolchains() {
     # Google Cloud SDK
     if [ -d "$HOME/google-cloud-sdk" ] && command -v gcloud &>/dev/null; then
         step "Dev: Google Cloud SDK components"
+        log_action "Checking Google Cloud SDK components..."
         gcloud components update --quiet || log_warn "gcloud update had issues, continuing..."
         log_ok "Google Cloud SDK updated."
     else skip_step "Google Cloud SDK" "not installed"; fi
@@ -742,6 +860,7 @@ run_dev_toolchains() {
     # VS Code Extensions
     if command -v code &>/dev/null; then
         step "Dev: Visual Studio Code extensions"
+        log_action "Checking Visual Studio Code extensions..."
         is_vscode_running \
             && echo -e "  ${YELLOW}[SKIP] VS Code is running; skipping extension updates.${RESET}" \
             || { code --update-extensions --force || log_warn "VS Code extension update had issues, continuing..."; log_ok "VS Code extensions updated."; }
@@ -750,7 +869,8 @@ run_dev_toolchains() {
     # Agent Skills
     if [ -f "$HOME/.agents/.skill-lock.json" ] && command -v npx &>/dev/null; then
         step "Dev: Agent Skills & Configurations"
-        timeout 60s npx -y skills update --yes || log_warn "Agent skills update had issues, continuing..."
+        log_action "Updating Agent Skills & Configurations..."
+        timeout --kill-after=10s 120s npx -y skills update --yes --global </dev/null || log_warn "Agent skills update had issues, continuing..."
         log_ok "Agent skills updated."
     else skip_step "Agent Skills lockfile" "not present"; fi
 }
@@ -766,22 +886,38 @@ run_git_docs() {
     all_repos+=( "$HOME/projects/docs/androidx" "$HOME/projects/docs/compose-samples"
                  "$HOME/projects/docs/horologist" "$HOME/projects/docs/nowinandroid" )
     local total="${#all_repos[@]}" idx=0
+    local tmp_dir; tmp_dir="$(mktemp -d -t git-docs-sync-XXXXXX)"
+    local pids=()
+    log_action "Synchronizing $total repositories in parallel..."
+
     for repo in "${all_repos[@]}"; do
         ((idx++))
         local rname; rname="$(basename "$repo")"
-        [ "$rname" = "androidx" ] \
-            && log_substep "$idx" "$total" "Checking AndroidX (~55k files)..." \
-            || log_substep "$idx" "$total" "Checking $rname..."
         if [ -d "$repo" ]; then
-            safe_git_repo_update "$repo"
-            [ "$rname" = "hermes-agent" ] && [ -d "$HOME/.hermes/hermes-agent/venv" ] && {
-                log_action "Updating Hermes editable Python env..."
-                timeout 60s "$HOME/.hermes/hermes-agent/venv/bin/pip" install --upgrade -e "$HOME/.hermes/hermes-agent" 2>/dev/null || true
-            }
+            (
+                _STEP_START_TIME=$(date +%s)
+                [ "$rname" = "androidx" ] \
+                    && log_substep "$idx" "$total" "Checking AndroidX (~55k files)..." \
+                    || log_substep "$idx" "$total" "Checking $rname..."
+                safe_git_repo_update "$repo"
+                if [ "$rname" = "hermes-agent" ] && [ -d "$HOME/.hermes/hermes-agent/venv" ]; then
+                    log_action "Updating Hermes editable Python env..."
+                    timeout 60s "$HOME/.hermes/hermes-agent/venv/bin/pip" install --upgrade -e "$HOME/.hermes/hermes-agent" 2>/dev/null || true
+                fi
+            ) > "$tmp_dir/$idx.log" 2>&1 &
+            pids+=($!)
         else
-            skip_step "$rname" "not found"
+            ( skip_step "$rname" "not found" ) > "$tmp_dir/$idx.log" 2>&1 &
+            pids+=($!)
         fi
     done
+
+    wait "${pids[@]}" 2>/dev/null || true
+
+    for i in $(seq 1 "$total"); do
+        [ -f "$tmp_dir/$i.log" ] && cat "$tmp_dir/$i.log"
+    done
+    rm -rf "$tmp_dir"
     log_ok "All Git repos checked."
 }
 
@@ -844,7 +980,7 @@ run_cleanup() {
     echo -e "${BOLD}${CYAN}          Checking for Required Service Restarts            ${RESET}"
     echo -e "${BOLD}${CYAN}============================================================${RESET}"
     if command -v dnf &>/dev/null; then
-        if sudo dnf needs-restarting -r >/dev/null 2>&1; then
+        if sudo dnf needs-restarting -q -r >/dev/null 2>&1; then
             log_ok "No reboot required."
         else
             echo -e "\n${BOLD}${RED}╔══════════════════════════════════════════════════════════╗${RESET}"
@@ -852,8 +988,13 @@ run_cleanup() {
             echo -e "${BOLD}${RED}╚══════════════════════════════════════════════════════════╝${RESET}"
             echo -e "  Run: ${BOLD}systemctl reboot${RESET}"
         fi
-        log_info "Services requiring restart:"
-        sudo dnf needs-restarting -s 2>/dev/null | sed 's/^/      /' || true
+        local restart_services; restart_services="$(sudo dnf needs-restarting -q -s 2>/dev/null || true)"
+        if [ -n "$restart_services" ]; then
+            log_info "Services requiring restart:"
+            echo "$restart_services" | sed 's/^/      /'
+        else
+            log_ok "No services require restart."
+        fi
     fi
 }
 
@@ -904,11 +1045,17 @@ should_run() {
     return 0
 }
 
+MODULE_KEYS=(); MODULE_LABELS=(); MODULE_DURATIONS=()
+
 run_module() {
-    local key="$1" fn="$2"; shift 2
+    local key="$1" label="$2" fn="$3"; shift 3
     should_run "$key" || return 0
+    MODULE_KEYS+=("$key")
+    MODULE_LABELS+=("$label")
     local t0 t1; t0=$(date +%s); "$fn" "$@"; t1=$(date +%s)
-    echo -e "  ${CYAN}[${key} time: $((t1 - t0))s]${RESET}"
+    local elapsed=$((t1 - t0))
+    MODULE_DURATIONS+=("$elapsed")
+    echo -e "  ${CYAN}[${key} time: $(format_duration "$elapsed")]${RESET}"
 }
 
 ###############################################################################
@@ -948,27 +1095,35 @@ main() {
         [ "$DO_TRIM" = "true" ] && TOTAL_STEPS=$((TOTAL_STEPS + 4)) || TOTAL_STEPS=$((TOTAL_STEPS + 3))
     }
 
-    run_module "core"     run_core_baseline
-    run_module "dnf"      run_system_dnf
-    run_module "flatpak"  run_flatpak
-    run_module "firmware" run_firmware
-    run_module "ai"       run_ai_runtimes
-    run_module "dev"      run_dev_toolchains
-    run_module "git"      run_git_docs
-    run_module "self"     run_self_update
-    run_module "cleanup"  run_cleanup "$DO_TRIM"
+    run_module "core"     "Core Baseline"      run_core_baseline
+    run_module "dnf"      "DNF Packages"       run_system_dnf
+    run_module "flatpak"  "Flatpaks"           run_flatpak
+    run_module "firmware" "Firmware (LVFS)"    run_firmware
+    run_module "ai"       "AI Runtimes"        run_ai_runtimes
+    run_module "dev"      "Dev Toolchains"     run_dev_toolchains
+    run_module "git"      "Git Documentation"  run_git_docs
+    run_module "self"     "Self-Update"        run_self_update
+    run_module "cleanup"  "System Cleanup"     run_cleanup "$DO_TRIM"
 
     local END_TIME DURATION
     END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
 
-    echo -e "\n${BOLD}${GREEN}============================================================${RESET}"
-    echo -e "${BOLD}${GREEN}  --- Update complete in ${DURATION}s! ---${RESET}"
-    echo -e "${CYAN}  Log: ${LOG_FILE}${RESET}"
-    echo -e "${BOLD}${GREEN}============================================================${RESET}\n"
+    echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}                     Execution Summary                      ${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+    for i in "${!MODULE_KEYS[@]}"; do
+        local lbl="${MODULE_LABELS[$i]}"
+        local sec="${MODULE_DURATIONS[$i]}"
+        printf "  %-24s %s\n" "${lbl}:" "$(format_duration "$sec")"
+    done
+    echo -e "${CYAN}------------------------------------------------------------${RESET}"
+    printf "  ${BOLD}%-24s %s${RESET}\n" "Total Time:" "$(format_duration "$DURATION")"
+    echo -e "${CYAN}  Log File:                ${LOG_FILE}${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}\n"
 
     command -v notify-send &>/dev/null && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && \
         notify-send --icon=software-update-available --urgency=normal \
-            "Fedora Update Complete" "Done in ${DURATION}s. Log: $LOG_FILE" 2>/dev/null || true
+            "Fedora Update Complete" "Done in $(format_duration "$DURATION"). Log: $LOG_FILE" 2>/dev/null || true
 }
 
 main "$@"
