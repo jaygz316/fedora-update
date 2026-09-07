@@ -139,7 +139,7 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 3.1.0 (Performance & Concurrency Optimization)
+- **Current Version:** 3.1.1 (Symlink Resolution & Self-Registration Fix)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
@@ -185,3 +185,9 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 - **Claude Code Deduplication:** Skips redundant `claude update` network call if Claude is installed under `~/.npm-global` and was already verified in the NPM step.
 - **UV Tool Caching & Force Flag:** Cached `uv tool list` before the missing tools loop and added `--force` to `uv tool install` so legacy pip wrappers are replaced and successfully registered with `uv`. Removed duplicate `uv cache prune` from Core Baseline.
 - **Clean Needs-Restarting Output:** Passed `-q` to `sudo dnf needs-restarting` to eliminate repo loading chatter, and gracefully report when zero services require restarting.
+
+### v3.1.1 (2026-09-07)
+
+**Bug Fixes**
+- **Canonical Script Directory Resolution:** Resolved `${BASH_SOURCE[0]}` using `readlink -f` across `update`, `update-all`, and `install.sh`. Previously, invoking `update` via a symlink in `~/.local/bin` resulted in `SCRIPT_DIR` evaluating to `~/.local/bin`.
+- **Prevented Circular Symlink Creation:** Fixed self-registration logic in `update` line 1079 and `install.sh` that inadvertently overwrote `~/.local/bin/update` and `~/.local/bin/update-all` with circular symlinks pointing to themselves when invoked from PATH. Added guard against linking to `~/.local/bin` and adopted `ln -sfn`.

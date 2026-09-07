@@ -6,7 +6,9 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+[ -z "$SCRIPT_PATH" ] && SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
 echo -e "\n\033[1;36m========================================\033[0m"
 echo -e "\033[1;36m  fedora-update: Install & Bootstrap     \033[0m"
@@ -18,9 +20,11 @@ echo -e "\033[0;32m[OK] Scripts marked executable.\033[0m"
 
 # 2. Create symlinks in ~/.local/bin
 mkdir -p "$HOME/.local/bin"
-ln -sf "$SCRIPT_DIR/update"     "$HOME/.local/bin/update"
-ln -sf "$SCRIPT_DIR/update-all" "$HOME/.local/bin/update-all"
-echo -e "\033[0;32m[OK] Symlinks created in ~/.local/bin.\033[0m"
+if [ "$SCRIPT_DIR" != "$HOME/.local/bin" ]; then
+    ln -sfn "$SCRIPT_DIR/update"     "$HOME/.local/bin/update"
+    ln -sfn "$SCRIPT_DIR/update-all" "$HOME/.local/bin/update-all"
+    echo -e "\033[0;32m[OK] Symlinks created in ~/.local/bin.\033[0m"
+fi
 
 # 3. Install + bootstrap Syncthing (if not already present)
 if ! command -v syncthing &>/dev/null; then
