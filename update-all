@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # update-all — same as `update` but also performs SSD TRIM (fstrim -av)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+[ -z "$SCRIPT_PATH" ] && SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 exec "$SCRIPT_DIR/update" --trim "$@"

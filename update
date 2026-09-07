@@ -15,6 +15,10 @@
 
 set -u
 
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+[ -z "$SCRIPT_PATH" ] && SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
 ###############################################################################
 # PATH — all user toolchain binaries available on any node
 ###############################################################################
@@ -926,7 +930,8 @@ run_git_docs() {
 ###############################################################################
 run_self_update() {
     step "Self-Update: Checking fedora-update suite"
-    local repo_path="$HOME/projects/update/fedora-update"
+    local repo_path="${SCRIPT_DIR:-$HOME/projects/update/fedora-update}"
+    [ ! -d "$repo_path/.git" ] && repo_path="$HOME/projects/update/fedora-update"
     if [ ! -d "$repo_path" ]; then log_warn "Repo not found at $repo_path; skipping."; return 0; fi
     # Safe: all functions are already in memory; updated script takes effect next run
     safe_git_repo_update "$repo_path"
@@ -1001,7 +1006,6 @@ run_cleanup() {
 ###############################################################################
 # CLI FLAGS & ARGUMENT PARSING
 ###############################################################################
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; export DRY_RUN
 
 usage() {
@@ -1073,12 +1077,16 @@ main() {
     echo -e "${BOLD}${CYAN}============================================================${RESET}\n"
 
     # Self-register symlinks on first run / after Syncthing sync to a new node
-    chmod +x "$SCRIPT_DIR/update" "$SCRIPT_DIR/update-all" "$SCRIPT_DIR/install.sh" 2>/dev/null || true
-    mkdir -p "$HOME/.local/bin"
-    [ "$(readlink -f "$HOME/.local/bin/update" 2>/dev/null)" != "$SCRIPT_DIR/update" ] && \
-        ln -sf "$SCRIPT_DIR/update" "$HOME/.local/bin/update" 2>/dev/null || true
-    [ "$(readlink -f "$HOME/.local/bin/update-all" 2>/dev/null)" != "$SCRIPT_DIR/update-all" ] && \
-        ln -sf "$SCRIPT_DIR/update-all" "$HOME/.local/bin/update-all" 2>/dev/null || true
+    if [ "$SCRIPT_DIR" != "$HOME/.local/bin" ] && [ -f "$SCRIPT_DIR/update" ]; then
+        chmod +x "$SCRIPT_DIR/update" "$SCRIPT_DIR/update-all" "$SCRIPT_DIR/install.sh" 2>/dev/null || true
+        mkdir -p "$HOME/.local/bin"
+        if [ "$(readlink -f "$HOME/.local/bin/update" 2>/dev/null || true)" != "$SCRIPT_DIR/update" ]; then
+            ln -sfn "$SCRIPT_DIR/update" "$HOME/.local/bin/update" 2>/dev/null || true
+        fi
+        if [ -f "$SCRIPT_DIR/update-all" ] && [ "$(readlink -f "$HOME/.local/bin/update-all" 2>/dev/null || true)" != "$SCRIPT_DIR/update-all" ]; then
+            ln -sfn "$SCRIPT_DIR/update-all" "$HOME/.local/bin/update-all" 2>/dev/null || true
+        fi
+    fi
 
     ensure_passwordless_sudo
 
