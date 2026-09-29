@@ -37,7 +37,7 @@ graph TD
     Runner --> Engine
     Engine --> Safety
     Engine --> Core
-    Core --> D1["Core Baseline: Pip, uv, Rust, Bun, Go, Docker, Android SDK/Studio, Micro, gh, Antigravity, Agy, Herdr"]
+    Core --> D1["Core Baseline: Node.js, npm, Pip, uv, Rust, Bun, Go, Docker, Android SDK/Studio, Micro, gh, Antigravity, Agy, Herdr"]
     Engine --> D2["Dynamic Updates: DNF, Flatpak, LVFS, Claude, LM Studio, Ollama models, Git Repos, System Cleanup"]
 ```
 
@@ -65,6 +65,7 @@ Everything is in one file. To add a new tool: open `update`, find the right `###
 
 | Component | Install Method (if missing) | Upkeep & Active Guard |
 | :--- | :--- | :--- |
+| **Node.js Runtime** | `nvm install --lts` (or `sudo dnf install -y nodejs npm`) | Auto-track LTS via `nvm` or system package manager |
 | **Python 3 `pip`** | `sudo dnf install -y python3-pip` | `python3 -m pip install --user --upgrade pip` |
 | **Astral `uv`** | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `uv self update` |
 | **NPM Global Prefix** | Set prefix to `$HOME/.npm-global` | `npm update -g` |
@@ -77,7 +78,7 @@ Everything is in one file. To add a new tool: open `update`, find the right `###
 | **Docker Engine & Compose** | Docker CE repo $\rightarrow$ `docker-ce`, `docker-compose-plugin`, enable systemd | DNF updates + `docker image prune -f` |
 | **Syncthing Sync Engine** | `sudo dnf install -y syncthing` $\rightarrow$ `0.0.0.0:8384` | User systemd service + DNF updates |
 | **Android CLI & SDK** | Google Commandline Tools $\rightarrow$ `~/Android/Sdk` | `android update` |
-| **Android Studio Preview** | Preview archive $\rightarrow$ `~/.local/opt/android-studio-preview` | Skip if running; update if idle |
+| **Android Studio Preview** | Canary archive $\rightarrow$ `/opt/android-studio-preview` | Skip if running; update if idle |
 | **Antigravity Desktop** | Cloud Run Manifest $\rightarrow$ `~/.local/opt/antigravity` | Skip if running; update if idle |
 | **Antigravity IDE** | Cloud Run API $\rightarrow$ `~/.local/opt/antigravity-ide` | Skip if running; update if idle |
 | **Agy CLI (`agy`)** | Official installer / npm $\rightarrow$ `~/.local/bin/agy` | Skip if active; `agy update` if idle |
@@ -101,9 +102,11 @@ Everything is in one file. To add a new tool: open `update`, find the right `###
 
 All AI agents interacting with this repository MUST adhere to these strict engineering principles:
 
-### Rule 1: Active Agent & App Protection (Zero Interruption)
+### Rule 1: Active Agent & App Protection (Zero Interruption by Default; Safe Restart with `--force`)
 - Before modifying or updating an AI agent, IDE, or editor (Antigravity IDE/Desktop, Agy, Claude, Herdr, Android Studio, VS Code), verify whether its process is actively working via `is_app_running`.
-- If the process is active, **do not replace or restart the application binary**. Skip the update for that run with an explicit notice to protect the user's active session.
+- **Default (Zero Interruption):** If the process is active, do not replace or restart the application binary. Skip the update for that run with an explicit notice to protect the user's active session.
+- **Force Mode (`--force` / `-f`):** When `--force` or `-f` is specified, `fedora-update` checks if an update is actually available first. If an update is required, it gracefully terminates the application (SIGTERM with clean shutdown wait and SIGKILL fallback), applies the update, and automatically relaunches the application (`gtk-launch` or background daemon).
+- **Ancestor Protection:** The update script verifies whether any running target process is an ancestor of the running shell (`$$`). If the script itself was spawned from inside an IDE or agent terminal, shutdown is automatically bypassed to prevent terminating the update run or user session.
 
 ### Rule 2: Syncthing Non-Interference & Git Worktree Guard
 - **Never modify Syncthing configuration, `.stignore`, or Syncthing service states.**
@@ -139,13 +142,22 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 3.1.1 (Symlink Resolution & Self-Registration Fix)
+- **Current Version:** 3.1.4 (Safe App Shutdown & Restart with `--force`)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
 ---
 
 ## 7. Changelog
+
+### v3.1.4 (2026-09-29)
+
+**New Features & Enhancements**
+- **Force Mode (`--force` / `-f`):** Added `--force` and `-f` flags to `update` and `update-all`. Running apps that would normally be skipped mid-session (Android Studio Preview, Antigravity Desktop, Antigravity IDE, VS Code, Agy CLI, Herdr CLI, Claude Code) are now safely shut down, updated, and automatically restarted once the update finishes.
+- **Graceful Shutdown & Fallback Escalation:** Implemented `safe_stop_app()` which sends SIGTERM to the root application processes to allow IDEs and Electron apps to flush state and exit cleanly, polls for exit up to 15s, and escalates to SIGKILL if processes hang.
+- **Automated Desktop & Background Relaunch:** Implemented `restart_app()` which re-executes applications via `gtk-launch` using standard desktop entries in graphical sessions (Wayland/X11) with headless/background `nohup` fallback.
+- **Ancestor Process Protection:** Guarded shutdown routines with `_is_ancestor_process()` to ensure that running `update --force` from an integrated IDE terminal or agent session does not inadvertently kill its own parent process tree.
+- **Version-Check-First Optimization:** Hoisted version/metadata checks before process shutdown across Android Studio Preview, Antigravity Desktop, Antigravity IDE, and Herdr so applications are never disrupted or restarted if they are already on the latest version.
 
 ### v2.1.0 (2026-08-24)
 
@@ -191,3 +203,18 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 **Bug Fixes**
 - **Canonical Script Directory Resolution:** Resolved `${BASH_SOURCE[0]}` using `readlink -f` across `update`, `update-all`, and `install.sh`. Previously, invoking `update` via a symlink in `~/.local/bin` resulted in `SCRIPT_DIR` evaluating to `~/.local/bin`.
 - **Prevented Circular Symlink Creation:** Fixed self-registration logic in `update` line 1079 and `install.sh` that inadvertently overwrote `~/.local/bin/update` and `~/.local/bin/update-all` with circular symlinks pointing to themselves when invoked from PATH. Added guard against linking to `~/.local/bin` and adopted `ln -sfn`.
+
+### v3.1.2 (2026-09-17)
+
+**New Features & Enhancements**
+- **Automated Android Studio Canary Tracking:** Upgraded Android Studio Preview maintenance to automatically query Google's official Canary update channel (`AI-1-eap` in `updates.xml`) and preview download manifest. Validates live CDN archive availability with fallback resilience, automatically updating `/opt/android-studio-preview/` to the latest Canary release.
+- **Process Safety & Zero Interruption:** Enhanced `is_android_studio_running` with `studio` ELF binary detection to protect active IDE sessions from in-flight updates.
+- **Launcher & Wrapper Synchronization:** Dynamically generates and syncs desktop entries and CLI wrapper scripts (`~/.local/bin/android-studio-preview`) to `/opt/android-studio-preview/bin/studio.sh`.
+- **Antigravity Desktop & IDE Icon Synchronization:** Added automated extraction of `icon.png` from `resources/app.asar` when installing or maintaining Google Antigravity Desktop. Configured `StartupWMClass` across desktop entries and synced icons into `~/.local/share/icons/hicolor/512x512/apps/` to prevent missing taskbar/dash application icons across all fleet nodes.
+
+### v3.1.3 (2026-09-24)
+
+**New Features & Enhancements**
+- **Node.js LTS Auto-Tracking & Runtime Management:** Added explicit Step 4 (`Core: Node.js Runtime`) to Core Fleet Baseline. Detects and tracks latest LTS via Node Version Manager (`nvm`) with automatic alias resolution (`lts/*`), with automated DNF fallback (`nodejs npm`) for nodes without nvm.
+- **Subshell Environment Initialization:** Sources `$NVM_DIR/nvm.sh` in the script preamble and during Node/NPM checks so all dependent toolchain steps inherit the active Node/npm environment seamlessly.
+- **Core Baseline Step Accounting:** Updated Core Baseline step tally to 19 steps and renumbered subsequent step comments and logging counters.
