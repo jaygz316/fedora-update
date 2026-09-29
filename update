@@ -5,6 +5,7 @@
 # Synced across machines via Syncthing (~/.gemini, ~/projects/).
 #
 # Usage: update [OPTIONS]
+#   --force, -f      Close running apps to apply updates, then restart them
 #   --trim           Also perform SSD TRIM (fstrim -av)
 #   --only=MODULE    Run only one section: core|dnf|flatpak|firmware|ai|dev|git|self|cleanup
 #   --skip=MODULES   Skip sections; comma-separated or repeated flag
@@ -27,12 +28,16 @@ for _dir in \
     "$HOME/.npm-global/bin" "$HOME/.lmstudio/bin" "$HOME/google-cloud-sdk/bin" \
     "$HOME/go/bin" "$HOME/Android/Sdk/cmdline-tools/latest/bin" \
     "$HOME/Android/Sdk/platform-tools" "$HOME/Android/Sdk/emulator" \
-    "$HOME/.local/opt/android-studio-preview/bin"
+    "/opt/android-studio-preview/bin" "$HOME/.local/opt/android-studio-preview/bin"
 do
     [ -d "$_dir" ] && [[ ":$PATH:" != *":$_dir:"* ]] && PATH="$_dir:$PATH"
 done
 export PATH
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env" 2>/dev/null || true
+if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    \. "$NVM_DIR/nvm.sh" 2>/dev/null || true
+fi
 
 ###############################################################################
 # COLORS & ENVIRONMENT
@@ -159,52 +164,200 @@ EOF
 }
 
 ###############################################################################
-# PROCESS DETECTION — protect running apps/agents from being updated mid-session
+# PROCESS DETECTION & SAFE SHUTDOWN / RESTART
 ###############################################################################
 _is_process_excluded() {
     local pid="$1"
     { [ "$pid" = "$$" ] || [ "$pid" = "${PPID:-0}" ] || [ "$pid" = "${BASHPID:-$$}" ]; } && return 0
     local comm; comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
     case "$comm" in pgrep|grep|bash|sh|zsh) return 0 ;; esac
-    local cmdline; cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    local cmdline; cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
     [[ "$cmdline" == *"telemetry_hook_bundle.js"* || "$cmdline" == *"fedora-update"* ]] && return 0
     return 1
 }
-_pids_running() {
-    # Returns 0 if any non-excluded pid from pgrep output is running
-    local pids="$1"
-    [ -z "$pids" ] && return 1
-    for pid in $pids; do _is_process_excluded "$pid" || return 0; done
+
+_is_ancestor_process() {
+    local target_pid="$1"
+    local cur="$$"
+    while [ -n "$cur" ] && [ "$cur" -gt 0 ] 2>/dev/null; do
+        [ "$cur" = "$target_pid" ] && return 0
+        cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ' || true)
+        [ -z "$cur" ] || [ "$cur" = "0" ] && break
+    done
     return 1
 }
-is_process_exact_running() { _pids_running "$(pgrep -x "$1" 2>/dev/null || true)"; }
-is_vscode_running()          { is_process_exact_running "code"; }
-is_antigravity_ide_running() { is_process_exact_running "antigravity-ide"; }
-is_android_studio_running() {
+
+get_android_studio_pids() {
     local pids; pids="$(pgrep -f 'com.intellij.idea.Main|/android-studio' 2>/dev/null || true)"
-    [ -z "$pids" ] && { is_process_exact_running "studio.sh" || is_process_exact_running "studio64"; return; }
+    if [ -z "$pids" ]; then
+        pids="$(pgrep -x "studio.sh" 2>/dev/null || true; pgrep -x "studio64" 2>/dev/null || true; pgrep -x "studio" 2>/dev/null || true)"
+    fi
+    local valid_pids=()
     for pid in $pids; do
         _is_process_excluded "$pid" && continue
-        local c; c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-        [[ "$c" == *"android-studio"* || "$c" == *"com.intellij.idea.Main"* ]] && return 0
-    done; return 1
+        local c; c=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+        [[ "$c" == *"android-studio"* || "$c" == *"com.intellij.idea.Main"* || "$c" == *"studio.sh"* || "$c" == *"studio"* ]] && valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
 }
-is_antigravity_desktop_running() {
+
+get_antigravity_desktop_pids() {
     local pids; pids="$(pgrep -x antigravity 2>/dev/null || true)"
+    local valid_pids=()
     for pid in $pids; do
         _is_process_excluded "$pid" && continue
-        local c; c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-        [[ "$c" == *"/opt/antigravity/antigravity"* && "$c" != *"antigravity-cli"* && "$c" != *"antigravity-ide"* ]] && return 0
-    done; return 1
+        local c; c=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+        [[ "$c" == *"/opt/antigravity/antigravity"* && "$c" != *"antigravity-cli"* && "$c" != *"antigravity-ide"* ]] && valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
 }
-is_cli_running() {
+
+get_antigravity_ide_pids() {
+    local pids; pids="$(pgrep -x antigravity-ide 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_vscode_pids() {
+    local pids; pids="$(pgrep -x code 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_cli_pids() {
     local name="$1"
     local pids; pids="$(pgrep -x "$name" 2>/dev/null || true)"
+    local valid_pids=()
     for pid in $pids; do
         _is_process_excluded "$pid" && continue
-        [ "$name" = "herdr" ] && { local c; c=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true); [[ "$c" == *"server"* ]] && continue; }
+        if [ "$name" = "herdr" ]; then
+            local c; c=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+            [[ "$c" == *"server"* ]] && continue
+        fi
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+is_android_studio_running()     { [ -n "$(get_android_studio_pids)" ]; }
+is_antigravity_desktop_running() { [ -n "$(get_antigravity_desktop_pids)" ]; }
+is_antigravity_ide_running()     { [ -n "$(get_antigravity_ide_pids)" ]; }
+is_vscode_running()              { [ -n "$(get_vscode_pids)" ]; }
+is_cli_running()                 { [ -n "$(get_cli_pids "$1")" ]; }
+
+safe_stop_app() {
+    local app_name="$1"
+    local pids_fn="$2"
+    local check_fn="$3"
+
+    local pids; pids="$($pids_fn)"
+    [ -z "$pids" ] && return 0
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log_info "[DRY-RUN] Would safely shut down $app_name (PIDs: $pids), apply update, and restart."
         return 0
-    done; return 1
+    fi
+
+    # Ancestor protection: ensure none of the PIDs are ancestors of this script ($$)
+    for pid in $pids; do
+        if _is_ancestor_process "$pid"; then
+            log_warn "$app_name (PID $pid) is an ancestor of this update process; skipping shutdown to protect current session."
+            return 1
+        fi
+    done
+
+    log_action "Sending graceful shutdown signal (SIGTERM) to $app_name..."
+
+    # Identify root PIDs (whose parent is NOT in $pids) to trigger application graceful shutdown
+    local root_pids=()
+    for pid in $pids; do
+        local ppid; ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+        if [[ ! " $pids " =~ " $ppid " ]]; then
+            root_pids+=("$pid")
+        fi
+    done
+    [ "${#root_pids[@]}" -eq 0 ] && root_pids=($pids)
+
+    for pid in "${root_pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    # Wait up to 5 seconds for root processes to initiate shutdown and exit
+    local waited=0
+    while "$check_fn" && [ "$waited" -lt 10 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+
+    # If child processes or other PIDs are still lingering, send SIGTERM to all remaining PIDs
+    if "$check_fn"; then
+        local remaining; remaining="$($pids_fn)"
+        for pid in $remaining; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        while "$check_fn" && [ "$waited" -lt 30 ]; do
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+    fi
+
+    # If still running after 15 seconds, escalate to SIGKILL
+    if "$check_fn"; then
+        log_warn "$app_name did not terminate cleanly within 15s; sending SIGKILL..."
+        local remaining; remaining="$($pids_fn)"
+        for pid in $remaining; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+
+    if "$check_fn"; then
+        log_err "Failed to stop $app_name; skipping update."
+        return 1
+    fi
+
+    log_ok "$app_name shut down safely."
+    return 0
+}
+
+restart_app() {
+    local app_name="$1"
+    local desktop_id="$2"
+    local fallback_cmd="$3"
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log_info "[DRY-RUN] Would restart $app_name."
+        return 0
+    fi
+
+    log_info "Restarting $app_name..."
+
+    # If in a desktop session (Wayland or X11), prefer desktop launcher via gtk-launch
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v gtk-launch &>/dev/null; then
+        if gtk-launch "$desktop_id" 2>/dev/null; then
+            log_ok "$app_name restarted via desktop launcher."
+            return 0
+        fi
+    fi
+
+    # Fallback to direct executable in background
+    if [ -n "$fallback_cmd" ]; then
+        nohup bash -c "$fallback_cmd" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        log_ok "$app_name restarted in background."
+        return 0
+    fi
+
+    log_warn "Could not restart $app_name (no launcher or command available)."
+    return 1
 }
 
 ###############################################################################
@@ -298,7 +451,55 @@ run_core_baseline() {
         uv self update 2>/dev/null || true; log_ok "uv up to date."
     fi
 
-    # 4. NPM Global Prefix & Tools
+    # 4. Node.js Runtime (nvm / DNF)
+    step "Core: Node.js Runtime"
+    local node_updated=false
+    if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+        export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+        \. "$NVM_DIR/nvm.sh" 2>/dev/null || true
+    fi
+
+    if type -t nvm &>/dev/null; then
+        local current_node remote_lts
+        current_node="$(nvm current 2>/dev/null || true)"
+        remote_lts="$(nvm version-remote --lts 2>/dev/null || true)"
+        if [ -n "$remote_lts" ] && [ "$remote_lts" != "N/A" ]; then
+            if [ -n "$current_node" ] && [ "$current_node" = "$remote_lts" ]; then
+                log_ok "Node.js (nvm LTS) up to date ($current_node)."
+                node_updated=true
+            else
+                if [ "${DRY_RUN:-false}" = "true" ]; then
+                    log_info "[DRY-RUN] Would install Node.js LTS ($remote_lts via nvm)..."
+                    node_updated=true
+                else
+                    log_action "Updating Node.js via nvm (${current_node:-none} -> $remote_lts)..."
+                    if nvm install --lts --reinstall-packages-from=current 2>/dev/null || nvm install --lts 2>/dev/null; then
+                        nvm alias default 'lts/*' 2>/dev/null || true
+                        nvm use --silent default 2>/dev/null || true
+                        log_ok "Node.js updated to $(node -v 2>/dev/null || echo "$remote_lts")."
+                        node_updated=true
+                    else
+                        log_warn "Failed to update Node.js via nvm."
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$node_updated" = "false" ]; then
+        if command -v node &>/dev/null; then
+            log_ok "Node.js active ($(node -v))."
+        else
+            log_bootstrap "Installing Node.js via DNF..."
+            if run_or_dry sudo dnf install -y nodejs npm 2>/dev/null; then
+                command -v node &>/dev/null && log_ok "Node.js installed ($(node -v))." || log_warn "Node.js installation could not be verified."
+            else
+                log_warn "Failed to install Node.js via DNF."
+            fi
+        fi
+    fi
+
+    # 5. NPM Global Prefix & Tools
     step "Core: NPM Global Configuration & Tools"
     if command -v npm &>/dev/null; then
         local npm_prefix; npm_prefix="$(npm config get prefix 2>/dev/null || true)"
@@ -318,7 +519,7 @@ run_core_baseline() {
         _NPM_GLOBAL_SYNCED=true
     fi
 
-    # 5. Python CLI Tools (uv tool / pip)
+    # 6. Python CLI Tools (uv tool / pip)
     step "Core: Python CLI Utilities Suite"
     local cli_tools=( esptool meshtastic openai-whisper mcp rich-click tabulate pyinstaller uvicorn websockets )
     local user_libs=( google-antigravity google-genai setuptools )
@@ -352,7 +553,7 @@ run_core_baseline() {
         log_ok "Python CLI utilities synced via pip."
     fi
 
-    # 6. Micro Editor
+    # 7. Micro Editor
     step "Core: Micro Editor"
     if ! command -v micro &>/dev/null; then
         log_bootstrap "Installing Micro editor..."
@@ -360,7 +561,7 @@ run_core_baseline() {
     fi
     command -v micro &>/dev/null && { micro -plugin update 2>/dev/null || true; log_ok "Micro editor + plugins up to date."; }
 
-    # 7. GitHub CLI (gh)
+    # 8. GitHub CLI (gh)
     step "Core: GitHub CLI (gh)"
     ! command -v gh &>/dev/null && { log_bootstrap "Installing GitHub CLI..."; sudo dnf install -y gh 2>/dev/null || true; }
     command -v gh &>/dev/null && {
@@ -368,7 +569,7 @@ run_core_baseline() {
         log_ok "GitHub CLI ready."
     }
 
-    # 8. Rust (rustup) + cargo tools
+    # 9. Rust (rustup) + cargo tools
     step "Core: Rust Toolchain & Cargo Tools (rustup)"
     if ! command -v rustup &>/dev/null && [ ! -f "$HOME/.cargo/bin/rustup" ]; then
         log_bootstrap "Installing Rustup..."
@@ -393,7 +594,7 @@ run_core_baseline() {
         log_ok "Rust toolchain up to date."
     fi
 
-    # 9. Bun Runtime
+    # 10. Bun Runtime
     step "Core: Bun JavaScript/TypeScript Runtime"
     if ! command -v bun &>/dev/null; then
         log_bootstrap "Installing Bun..."; curl -fsSL https://bun.sh/install | bash; export PATH="$HOME/.bun/bin:$PATH"
@@ -401,7 +602,7 @@ run_core_baseline() {
         bun upgrade 2>/dev/null || true; log_ok "Bun up to date."
     fi
 
-    # 10. Go + tooling (gopls, dlv)
+    # 11. Go + tooling (gopls, dlv)
     step "Core: Go Compiler & Developer Tooling"
     ! command -v go &>/dev/null && { log_bootstrap "Installing Go via DNF..."; sudo dnf install -y golang 2>/dev/null || true; }
     command -v go &>/dev/null && {
@@ -410,7 +611,7 @@ run_core_baseline() {
         log_ok "Go tooling verified."
     }
 
-    # 11. Docker Engine & Compose
+    # 12. Docker Engine & Compose
     step "Core: Docker Engine & Docker Compose"
     if ! command -v docker &>/dev/null; then
         log_bootstrap "Installing Docker CE + Compose plugin..."
@@ -426,7 +627,7 @@ run_core_baseline() {
         log_ok "Docker Engine active."
     fi
 
-    # 12. Android CLI & SDK
+    # 13. Android CLI & SDK
     step "Core: Android CLI & SDK Tools"
     local android_sdk_dir="$HOME/Android/Sdk"
     if ! command -v android &>/dev/null && [ ! -d "$android_sdk_dir/cmdline-tools" ]; then
@@ -456,65 +657,238 @@ WRAPPER
         android update 2>/dev/null || true; log_ok "Android CLI up to date."
     fi
 
-    # 13. Android Studio Preview
-    step "Core: Android Studio Latest Preview"
-    local studio_preview_dir="$HOME/.local/opt/android-studio-preview"
-    if is_android_studio_running; then
-        echo -e "  ${YELLOW}[SKIP] Android Studio is running; skipping update.${RESET}"
-    elif [ ! -d "$studio_preview_dir" ] && [ ! -f "$HOME/.local/bin/android-studio-preview" ]; then
-        log_bootstrap "Setting up Android Studio Preview launchers..."
-        mkdir -p "$studio_preview_dir" "$HOME/.local/share/applications" "$HOME/.local/bin"
-        cat << DESKTOP > "$HOME/.local/share/applications/android-studio-preview.desktop"
+    # 14. Android Studio Preview (Canary Channel)
+    step "Core: Android Studio Latest Preview (Canary)"
+    local studio_preview_dir="/opt/android-studio-preview"
+
+    # Clean up empty legacy directory if present
+    if [ -d "$HOME/.local/opt/android-studio-preview" ] && [ -z "$(ls -A "$HOME/.local/opt/android-studio-preview" 2>/dev/null)" ]; then
+        rmdir "$HOME/.local/opt/android-studio-preview" 2>/dev/null || true
+    fi
+
+    if [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; then
+        log_warn "Android Studio Preview Linux builds are only available for x86_64 (detected: $arch)."
+    else
+        _ensure_studio_preview_launchers() {
+            mkdir -p "$HOME/.local/share/applications" "$HOME/.local/bin"
+            local icon_path="$studio_preview_dir/bin/studio.svg"
+            [ ! -f "$icon_path" ] && [ -f "$studio_preview_dir/bin/studio.png" ] && icon_path="$studio_preview_dir/bin/studio.png"
+            if [ ! -f "$HOME/.local/share/applications/android-studio-preview.desktop" ] || \
+               ! grep -q "^Exec=$studio_preview_dir/bin/studio.sh" "$HOME/.local/share/applications/android-studio-preview.desktop" 2>/dev/null; then
+                cat << DESKTOP > "$HOME/.local/share/applications/android-studio-preview.desktop"
 [Desktop Entry]
 Name=Android Studio Preview
 Exec=$studio_preview_dir/bin/studio.sh
-Icon=$studio_preview_dir/bin/studio.png
+Icon=$icon_path
 Type=Application
 Terminal=false
 Categories=Development;IDE;
 DESKTOP
-        cat << WRAPPER > "$HOME/.local/bin/android-studio-preview"
+                [ -d "$HOME/Desktop" ] && cp "$HOME/.local/share/applications/android-studio-preview.desktop" "$HOME/Desktop/" 2>/dev/null || true
+                [ -f "$HOME/Desktop/android-studio-preview.desktop" ] && chmod +x "$HOME/Desktop/android-studio-preview.desktop" 2>/dev/null || true
+            fi
+            if [ ! -f "$HOME/.local/bin/android-studio-preview" ] || \
+               ! grep -q "exec \"$studio_preview_dir/bin/studio.sh\"" "$HOME/.local/bin/android-studio-preview" 2>/dev/null; then
+                cat << WRAPPER > "$HOME/.local/bin/android-studio-preview"
 #!/usr/bin/env bash
 exec "$studio_preview_dir/bin/studio.sh" "\$@"
 WRAPPER
-        chmod +x "$HOME/.local/bin/android-studio-preview"
-        log_ok "Android Studio Preview launchers registered."
-    else
-        log_ok "Android Studio Preview verified."
+                chmod +x "$HOME/.local/bin/android-studio-preview"
+            fi
+        }
+
+        local canary_meta; canary_meta="$(python3 - << 'PY_CANARY' 2>/dev/null || true
+import urllib.request, xml.etree.ElementTree as ET, re
+
+def check_url(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-10"})
+    try:
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return resp.status in (200, 206)
+    except Exception:
+        return False
+
+found_url = None
+found_ver = None
+found_build = None
+
+try:
+    p_req = urllib.request.Request("https://developer.android.com/studio/preview", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(p_req, timeout=5) as p_resp:
+        p_html = p_resp.read().decode("utf-8", errors="ignore")
+    m_url = re.search(r"data-category=[\x22\x27]canary_linux_bundle_download[\x22\x27][^>]*href=[\x22\x27](https://[^\s\x22\x27]+)[\x22\x27]", p_html)
+    if not m_url:
+        m_url = re.search(r"href=[\x22\x27](https://[^\s\x22\x27]+android-studio[^\s\x22\x27]*-linux\.tar\.gz)[\x22\x27][^>]*data-category=[\x22\x27]canary_linux_bundle_download[\x22\x27]", p_html)
+    if m_url and check_url(m_url.group(1)):
+        found_url = m_url.group(1)
+        m_title = re.search(r"data-text=[\x22\x27]Download (Android Studio [^\s\x22\x27][^\x22\x27]*)[\x22\x27]", p_html)
+        if m_title:
+            found_ver = m_title.group(1)
+except Exception:
+    pass
+
+try:
+    u_req = urllib.request.Request("https://dl.google.com/android/studio/patches/updates.xml", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(u_req, timeout=5) as u_resp:
+        u_xml = u_resp.read()
+    root = ET.fromstring(u_xml)
+    ch = next((c for c in root.findall(".//channel") if c.get("id") == "AI-1-eap"), None)
+    if ch is not None:
+        if found_url:
+            for b in ch.findall("build"):
+                if found_ver and (b.get("version", "") in found_ver or found_ver in b.get("version", "")):
+                    found_build = b.get("number")
+                    break
+            if not found_build:
+                first = ch.find("build")
+                if first is not None:
+                    found_build = first.get("number")
+        else:
+            for b in ch.findall("build")[:6]:
+                ver = b.get("version", "")
+                num = b.get("number", "")
+                m = re.match(r"([A-Za-z]+)\s*(\d+)?\s*\|\s*([\d\.]+)\s+Canary\s+(\d+)", ver)
+                if m:
+                    codename = m.group(1).lower()
+                    major = m.group(2) or ""
+                    rel = m.group(3)
+                    canary = m.group(4)
+                    dir_v = f"{rel}.{canary}"
+                    fname = f"android-studio-{codename}{major}-canary{canary}-linux.tar.gz"
+                    cand_url = f"https://edgedl.me.gvt1.com/android/studio/ide-zips/{dir_v}/{fname}"
+                    if check_url(cand_url):
+                        found_url = cand_url
+                        found_ver = f"Android Studio {ver}"
+                        found_build = num
+                        break
+except Exception:
+    pass
+
+if found_url and found_ver:
+    print(found_ver)
+    print(found_build if found_build else "none")
+    print(found_url)
+PY_CANARY
+)"
+
+        local latest_ver; latest_ver="$(sed -n '1p' <<< "$canary_meta")"
+        local latest_build; latest_build="$(sed -n '2p' <<< "$canary_meta")"
+        local download_url; download_url="$(sed -n '3p' <<< "$canary_meta")"
+
+        local current_build=""
+        [ -f "$studio_preview_dir/build.txt" ] && current_build="$(tr -d ' \r\n' < "$studio_preview_dir/build.txt" 2>/dev/null || true)"
+        local current_ver=""
+        [ -f "$studio_preview_dir/.version" ] && current_ver="$(cat "$studio_preview_dir/.version" 2>/dev/null || true)"
+
+        if [ -n "$latest_build" ] && [ "$latest_build" != "none" ] && [ -n "$current_build" ] && [ "$current_build" = "$latest_build" ]; then
+            log_ok "Android Studio Preview up to date (${latest_ver:-$current_build})."
+            _ensure_studio_preview_launchers
+        elif [ -n "$latest_ver" ] && [ -n "$current_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
+            log_ok "Android Studio Preview up to date ($latest_ver)."
+            _ensure_studio_preview_launchers
+        elif [ -n "$download_url" ] && [ -n "$latest_ver" ]; then
+            local was_running=false
+            local proceed=true
+            if is_android_studio_running; then
+                if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+                    echo -e "  ${YELLOW}[SKIP] Android Studio is running; skipping update (use --force to restart).${RESET}"
+                    _ensure_studio_preview_launchers
+                    proceed=false
+                elif ! safe_stop_app "Android Studio" get_android_studio_pids is_android_studio_running; then
+                    _ensure_studio_preview_launchers
+                    proceed=false
+                else
+                    was_running=true
+                fi
+            fi
+
+            if [ "$proceed" = "true" ]; then
+                if [ "${DRY_RUN:-false}" = "true" ]; then
+                    log_info "[DRY-RUN] Would update Android Studio Preview (${current_ver:-${current_build:-none}} -> $latest_ver)..."
+                    _ensure_studio_preview_launchers
+                    [ "$was_running" = "true" ] && restart_app "Android Studio" "android-studio-preview" "$studio_preview_dir/bin/studio.sh"
+                else
+                    log_info "Updating Android Studio Preview (${current_ver:-${current_build:-none}} -> $latest_ver)..."
+                    log_action "Downloading Android Studio Preview archive ($latest_ver)..."
+                    local tmp_w; tmp_w="$(mktemp -d -t studio-preview-update-XXXXXX)"
+                    if curl -# -fSL -o "$tmp_w/studio.tar.gz" "$download_url" 2>/dev/null; then
+                        log_action "Extracting and installing to $studio_preview_dir..."
+                        mkdir -p "$tmp_w/x"
+                        if tar -xzf "$tmp_w/studio.tar.gz" -C "$tmp_w/x"; then
+                            local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+                            [ -z "$pd" ] && pd="$tmp_w/x"
+                            if [ -f "$pd/bin/studio.sh" ] || [ -f "$pd/bin/studio" ]; then
+                                if [ -w "/opt" ] || [ -w "$studio_preview_dir" ]; then
+                                    mkdir -p "$studio_preview_dir"
+                                    find "$studio_preview_dir" -mindepth 1 -delete 2>/dev/null || true
+                                    mv "$pd"/* "$studio_preview_dir/"
+                                    echo "$latest_ver" > "$studio_preview_dir/.version"
+                                    chmod +x "$studio_preview_dir/bin/studio" "$studio_preview_dir/bin/studio.sh" 2>/dev/null || true
+                                else
+                                    sudo mkdir -p "$studio_preview_dir"
+                                    sudo find "$studio_preview_dir" -mindepth 1 -delete 2>/dev/null || true
+                                    sudo mv "$pd"/* "$studio_preview_dir/"
+                                    sudo chown -R "$(id -u):$(id -g)" "$studio_preview_dir"
+                                    echo "$latest_ver" > "$studio_preview_dir/.version"
+                                    chmod +x "$studio_preview_dir/bin/studio" "$studio_preview_dir/bin/studio.sh" 2>/dev/null || true
+                                fi
+                                _ensure_studio_preview_launchers
+                                log_ok "Android Studio Preview updated to $latest_ver."
+                                if [ "$was_running" = "true" ]; then
+                                    restart_app "Android Studio" "android-studio-preview" "$studio_preview_dir/bin/studio.sh"
+                                fi
+                            else
+                                log_warn "Extracted Android Studio archive does not contain studio launcher."
+                            fi
+                        else
+                            log_warn "Failed to extract Android Studio archive."
+                        fi
+                    else
+                        log_warn "Failed to download Android Studio archive from $download_url"
+                    fi
+                    rm -rf "$tmp_w"
+                fi
+            fi
+        else
+            if [ -d "$studio_preview_dir" ]; then
+                log_ok "Android Studio Preview verified (${current_ver:-${current_build:-installed}})."
+                _ensure_studio_preview_launchers
+            else
+                log_warn "Android Studio Canary metadata unavailable; skipping install."
+            fi
+        fi
     fi
 
-    # 14. Google Antigravity Desktop
+    # 15. Google Antigravity Desktop
     step "Core: Google Antigravity Desktop"
     local antigravity_dir="$HOME/.local/opt/antigravity"
-    if is_antigravity_desktop_running; then
-        echo -e "  ${YELLOW}[SKIP] Antigravity Desktop is active; skipping update.${RESET}"
-    else
-        local arch_dir=""
-        case "$arch" in x86_64|amd64) arch_dir="linux-x64" ;; aarch64|arm64) arch_dir="linux-arm64" ;;
-            *) log_warn "Unsupported arch for Antigravity Desktop: $arch" ;;
-        esac
-        if [ -n "$arch_dir" ]; then
-            local manifest_data; manifest_data="$(curl -s --max-time 5 \
-                'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-x64-linux.yml' \
-                2>/dev/null || true)"
-            local current_ver=""; [ -f "$antigravity_dir/.version" ] && current_ver="$(cat "$antigravity_dir/.version" 2>/dev/null || true)"
-            local latest_ver; latest_ver="$(echo "$manifest_data" | grep -E '^version:' | awk '{print $2}' || true)"
-            if [ -n "$current_ver" ] && [ -n "$latest_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
-                log_ok "Antigravity Desktop up to date ($current_ver)."
-            elif [ -n "$manifest_data" ] && [ -n "$latest_ver" ]; then
-                log_info "Updating Antigravity Desktop (${current_ver:-none} -> $latest_ver)..."
-                log_action "Downloading Antigravity Desktop archive ($latest_ver)..."
-                local base_url; base_url="$(echo "$manifest_data" | grep -o 'https://storage.googleapis.com/antigravity-public/antigravity-hub/[^/]*' | head -n 1)"
-                local tmp_w; tmp_w="$(mktemp -d -t antigravity-update-XXXXXX)"
-                if curl -# -fSL -o "$tmp_w/Antigravity.tar.gz" "${base_url}/${arch_dir}/Antigravity.tar.gz" 2>/dev/null; then
-                    log_action "Extracting and installing to $antigravity_dir..."
-                    mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity.tar.gz" -C "$tmp_w/x"
-                    local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
-                    if [ -f "$pd/antigravity" ]; then
-                        rm -rf "$antigravity_dir"; mkdir -p "$antigravity_dir"; mv "$pd"/* "$antigravity_dir/"
-                        chmod +x "$antigravity_dir/antigravity"; echo "$latest_ver" > "$antigravity_dir/.version"
-                        mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
-                        cat << DESKTOP > "$HOME/.local/share/applications/antigravity.desktop"
+
+    _ensure_antigravity_desktop_launchers() {
+        mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
+        local asar_file="$antigravity_dir/resources/app.asar"
+        if [ -f "$asar_file" ] && [ ! -f "$antigravity_dir/icon.png" ]; then
+            python3 -c "
+import struct, json
+try:
+    with open('$asar_file', 'rb') as f:
+        v1, v2, v3, v4 = struct.unpack('<IIII', f.read(16))
+        header = json.loads(f.read(v4).decode('utf-8'))
+        info = header.get('files', {}).get('icon.png', {})
+        if 'offset' in info and 'size' in info:
+            f.seek(8 + v2 + int(info['offset']))
+            with open('$antigravity_dir/icon.png', 'wb') as out:
+                out.write(f.read(info['size']))
+except Exception:
+    pass
+" 2>/dev/null || true
+        fi
+        if [ -f "$antigravity_dir/icon.png" ]; then
+            mkdir -p "$HOME/.local/share/icons/hicolor/512x512/apps"
+            cp "$antigravity_dir/icon.png" "$HOME/.local/share/icons/hicolor/512x512/apps/antigravity.png" 2>/dev/null || true
+        fi
+        if [ ! -f "$HOME/.local/share/applications/antigravity.desktop" ] || \
+           ! grep -q "^StartupWMClass=Antigravity" "$HOME/.local/share/applications/antigravity.desktop" 2>/dev/null; then
+            cat << DESKTOP > "$HOME/.local/share/applications/antigravity.desktop"
 [Desktop Entry]
 Name=Antigravity
 Exec=$antigravity_dir/antigravity --no-sandbox
@@ -522,58 +896,95 @@ Icon=$antigravity_dir/icon.png
 Type=Application
 Terminal=false
 Categories=Development;IDE;
+StartupWMClass=Antigravity
 DESKTOP
-                        cp "$HOME/.local/share/applications/antigravity.desktop" "$HOME/Desktop/" 2>/dev/null || true
-                        chmod +x "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
-                        cat << WRAPPER > "$HOME/.local/bin/antigravity"
+            cp "$HOME/.local/share/applications/antigravity.desktop" "$HOME/Desktop/" 2>/dev/null || true
+            chmod +x "$HOME/Desktop/antigravity.desktop" 2>/dev/null || true
+        fi
+        if [ ! -f "$HOME/.local/bin/antigravity" ] || \
+           ! grep -q "exec \"$antigravity_dir/antigravity\"" "$HOME/.local/bin/antigravity" 2>/dev/null; then
+            cat << WRAPPER > "$HOME/.local/bin/antigravity"
 #!/bin/bash
 exec "$antigravity_dir/antigravity" --no-sandbox "\$@"
 WRAPPER
-                        chmod +x "$HOME/.local/bin/antigravity"
-                        log_ok "Antigravity Desktop updated to $latest_ver."
-                    fi
+            chmod +x "$HOME/.local/bin/antigravity"
+        fi
+    }
+
+    local arch_dir=""
+    case "$arch" in x86_64|amd64) arch_dir="linux-x64" ;; aarch64|arm64) arch_dir="linux-arm64" ;;
+        *) log_warn "Unsupported arch for Antigravity Desktop: $arch" ;;
+    esac
+    if [ -n "$arch_dir" ]; then
+        local manifest_data; manifest_data="$(curl -s --max-time 5 \
+            'https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-x64-linux.yml' \
+            2>/dev/null || true)"
+        local current_ver=""; [ -f "$antigravity_dir/.version" ] && current_ver="$(cat "$antigravity_dir/.version" 2>/dev/null || true)"
+        local latest_ver; latest_ver="$(echo "$manifest_data" | grep -E '^version:' | awk '{print $2}' || true)"
+        if [ -n "$current_ver" ] && [ -n "$latest_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
+            log_ok "Antigravity Desktop up to date ($current_ver)."
+            _ensure_antigravity_desktop_launchers
+        elif [ -n "$manifest_data" ] && [ -n "$latest_ver" ]; then
+            local was_running=false
+            local proceed=true
+            if is_antigravity_desktop_running; then
+                if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+                    echo -e "  ${YELLOW}[SKIP] Antigravity Desktop is active; skipping update (use --force to restart).${RESET}"
+                    _ensure_antigravity_desktop_launchers
+                    proceed=false
+                elif ! safe_stop_app "Antigravity Desktop" get_antigravity_desktop_pids is_antigravity_desktop_running; then
+                    _ensure_antigravity_desktop_launchers
+                    proceed=false
+                else
+                    was_running=true
                 fi
-                rm -rf "$tmp_w"
+            fi
+
+            if [ "$proceed" = "true" ]; then
+                if [ "${DRY_RUN:-false}" = "true" ]; then
+                    log_info "[DRY-RUN] Would update Antigravity Desktop (${current_ver:-none} -> $latest_ver)..."
+                    _ensure_antigravity_desktop_launchers
+                    [ "$was_running" = "true" ] && restart_app "Antigravity Desktop" "antigravity" "$antigravity_dir/antigravity --no-sandbox"
+                else
+                    log_info "Updating Antigravity Desktop (${current_ver:-none} -> $latest_ver)..."
+                    log_action "Downloading Antigravity Desktop archive ($latest_ver)..."
+                    local base_url; base_url="$(echo "$manifest_data" | grep -o 'https://storage.googleapis.com/antigravity-public/antigravity-hub/[^/]*' | head -n 1)"
+                    local tmp_w; tmp_w="$(mktemp -d -t antigravity-update-XXXXXX)"
+                    if curl -# -fSL -o "$tmp_w/Antigravity.tar.gz" "${base_url}/${arch_dir}/Antigravity.tar.gz" 2>/dev/null; then
+                        log_action "Extracting and installing to $antigravity_dir..."
+                        mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity.tar.gz" -C "$tmp_w/x"
+                        local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
+                        if [ -f "$pd/antigravity" ]; then
+                            rm -rf "$antigravity_dir"; mkdir -p "$antigravity_dir"; mv "$pd"/* "$antigravity_dir/"
+                            chmod +x "$antigravity_dir/antigravity"; echo "$latest_ver" > "$antigravity_dir/.version"
+                            _ensure_antigravity_desktop_launchers
+                            log_ok "Antigravity Desktop updated to $latest_ver."
+                            if [ "$was_running" = "true" ]; then
+                                restart_app "Antigravity Desktop" "antigravity" "$antigravity_dir/antigravity --no-sandbox"
+                            fi
+                        fi
+                    fi
+                    rm -rf "$tmp_w"
+                fi
             fi
         fi
     fi
 
-    # 15. Google Antigravity IDE
+    # 16. Google Antigravity IDE
     step "Core: Google Antigravity IDE"
     local antigravity_ide_dir="$HOME/.local/opt/antigravity-ide"
-    if is_antigravity_ide_running; then
-        echo -e "  ${YELLOW}[SKIP] Antigravity IDE is active; skipping update.${RESET}"
-    else
-        local arch_ep=""
-        case "$arch" in x86_64|amd64) arch_ep="linux-x64" ;; aarch64|arm64) arch_ep="linux-arm64" ;;
-            *) log_warn "Unsupported arch for Antigravity IDE: $arch" ;;
-        esac
-        if [ -n "$arch_ep" ]; then
-            local response; response="$(curl -s --max-time 5 \
-                "https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/api/update/${arch_ep}/stable/latest" \
-                2>/dev/null || true)"
-            local download_url; download_url="$(echo "$response" | grep -o '"url":"[^"]*"' | cut -d'"' -f4 || true)"
-            local current_ide=""; [ -f "$antigravity_ide_dir/.version" ] && current_ide="$(cat "$antigravity_ide_dir/.version" 2>/dev/null || true)"
-            local latest_ide=""; [ -n "$download_url" ] && latest_ide="$(echo "$download_url" | sed -E 's|.*/stable/([^/-]+).*|\1|')"
-            if [ -n "$current_ide" ] && [ -n "$latest_ide" ] && [ "$current_ide" = "$latest_ide" ]; then
-                log_ok "Antigravity IDE up to date ($current_ide)."
-            elif [ -n "$download_url" ] && [ -n "$latest_ide" ]; then
-                log_info "Updating Antigravity IDE (${current_ide:-none} -> $latest_ide)..."
-                log_action "Downloading Antigravity IDE archive ($latest_ide)..."
-                local tmp_w; tmp_w="$(mktemp -d -t antigravity-ide-update-XXXXXX)"
-                if curl -# -fSL -o "$tmp_w/Antigravity-IDE.tar.gz" "${download_url// /%20}" 2>/dev/null; then
-                    log_action "Extracting and installing to $antigravity_ide_dir..."
-                    mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity-IDE.tar.gz" -C "$tmp_w/x"
-                    local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
-                    if [ -f "$pd/antigravity-ide" ] || [ -f "$pd/antigravity" ]; then
-                        rm -rf "$antigravity_ide_dir"; mkdir -p "$antigravity_ide_dir"; mv "$pd"/* "$antigravity_ide_dir/"
-                        [ -f "$antigravity_ide_dir/antigravity-ide" ] && chmod +x "$antigravity_ide_dir/antigravity-ide"
-                        [ -f "$antigravity_ide_dir/antigravity" ]     && chmod +x "$antigravity_ide_dir/antigravity"
-                        echo "$latest_ide" > "$antigravity_ide_dir/.version"
-                        [ -f "$antigravity_ide_dir/resources/app/resources/linux/code.png" ] && \
-                            cp "$antigravity_ide_dir/resources/app/resources/linux/code.png" "$antigravity_ide_dir/icon.png"
-                        mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
-                        cat << DESKTOP > "$HOME/.local/share/applications/antigravity-ide.desktop"
+
+    _ensure_antigravity_ide_launchers() {
+        [ -f "$antigravity_ide_dir/resources/app/resources/linux/code.png" ] && [ ! -f "$antigravity_ide_dir/icon.png" ] && \
+            cp "$antigravity_ide_dir/resources/app/resources/linux/code.png" "$antigravity_ide_dir/icon.png" 2>/dev/null || true
+        if [ -f "$antigravity_ide_dir/icon.png" ]; then
+            mkdir -p "$HOME/.local/share/icons/hicolor/512x512/apps"
+            cp "$antigravity_ide_dir/icon.png" "$HOME/.local/share/icons/hicolor/512x512/apps/antigravity-ide.png" 2>/dev/null || true
+        fi
+        mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop" "$HOME/.local/bin"
+        if [ ! -f "$HOME/.local/share/applications/antigravity-ide.desktop" ] || \
+           ! grep -q "^StartupWMClass=antigravity-ide" "$HOME/.local/share/applications/antigravity-ide.desktop" 2>/dev/null; then
+            cat << DESKTOP > "$HOME/.local/share/applications/antigravity-ide.desktop"
 [Desktop Entry]
 Name=Antigravity-IDE
 Exec=$antigravity_ide_dir/antigravity-ide --no-sandbox
@@ -581,49 +992,122 @@ Icon=$antigravity_ide_dir/icon.png
 Type=Application
 Terminal=false
 Categories=Development;IDE;
+StartupWMClass=antigravity-ide
 DESKTOP
-                        cp "$HOME/.local/share/applications/antigravity-ide.desktop" "$HOME/Desktop/" 2>/dev/null || true
-                        chmod +x "$HOME/Desktop/antigravity-ide.desktop" 2>/dev/null || true
-                        cat << WRAPPER > "$HOME/.local/bin/antigravity-ide"
+            cp "$HOME/.local/share/applications/antigravity-ide.desktop" "$HOME/Desktop/" 2>/dev/null || true
+            chmod +x "$HOME/Desktop/antigravity-ide.desktop" 2>/dev/null || true
+        fi
+        if [ ! -f "$HOME/.local/bin/antigravity-ide" ] || \
+           ! grep -q "exec \"$antigravity_ide_dir/antigravity-ide\"" "$HOME/.local/bin/antigravity-ide" 2>/dev/null; then
+            cat << WRAPPER > "$HOME/.local/bin/antigravity-ide"
 #!/bin/bash
 exec "$antigravity_ide_dir/antigravity-ide" --no-sandbox "\$@"
 WRAPPER
-                        chmod +x "$HOME/.local/bin/antigravity-ide"
-                        log_ok "Antigravity IDE updated to $latest_ide."
-                    fi
+            chmod +x "$HOME/.local/bin/antigravity-ide"
+        fi
+    }
+
+    local arch_ep=""
+    case "$arch" in x86_64|amd64) arch_ep="linux-x64" ;; aarch64|arm64) arch_ep="linux-arm64" ;;
+        *) log_warn "Unsupported arch for Antigravity IDE: $arch" ;;
+    esac
+    if [ -n "$arch_ep" ]; then
+        local response; response="$(curl -s --max-time 5 \
+            "https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/api/update/${arch_ep}/stable/latest" \
+            2>/dev/null || true)"
+        local download_url; download_url="$(echo "$response" | grep -o '"url":"[^"]*"' | cut -d'"' -f4 || true)"
+        local current_ide=""; [ -f "$antigravity_ide_dir/.version" ] && current_ide="$(cat "$antigravity_ide_dir/.version" 2>/dev/null || true)"
+        local latest_ide=""; [ -n "$download_url" ] && latest_ide="$(echo "$download_url" | sed -E 's|.*/stable/([^/-]+).*|\1|')"
+        if [ -n "$current_ide" ] && [ -n "$latest_ide" ] && [ "$current_ide" = "$latest_ide" ]; then
+            log_ok "Antigravity IDE up to date ($current_ide)."
+            _ensure_antigravity_ide_launchers
+        elif [ -n "$download_url" ] && [ -n "$latest_ide" ]; then
+            local was_running=false
+            local proceed=true
+            if is_antigravity_ide_running; then
+                if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+                    echo -e "  ${YELLOW}[SKIP] Antigravity IDE is active; skipping update (use --force to restart).${RESET}"
+                    _ensure_antigravity_ide_launchers
+                    proceed=false
+                elif ! safe_stop_app "Antigravity IDE" get_antigravity_ide_pids is_antigravity_ide_running; then
+                    _ensure_antigravity_ide_launchers
+                    proceed=false
+                else
+                    was_running=true
                 fi
-                rm -rf "$tmp_w"
+            fi
+
+            if [ "$proceed" = "true" ]; then
+                if [ "${DRY_RUN:-false}" = "true" ]; then
+                    log_info "[DRY-RUN] Would update Antigravity IDE (${current_ide:-none} -> $latest_ide)..."
+                    _ensure_antigravity_ide_launchers
+                    [ "$was_running" = "true" ] && restart_app "Antigravity IDE" "antigravity-ide" "$antigravity_ide_dir/antigravity-ide --no-sandbox"
+                else
+                    log_info "Updating Antigravity IDE (${current_ide:-none} -> $latest_ide)..."
+                    log_action "Downloading Antigravity IDE archive ($latest_ide)..."
+                    local tmp_w; tmp_w="$(mktemp -d -t antigravity-ide-update-XXXXXX)"
+                    if curl -# -fSL -o "$tmp_w/Antigravity-IDE.tar.gz" "${download_url// /%20}" 2>/dev/null; then
+                        log_action "Extracting and installing to $antigravity_ide_dir..."
+                        mkdir -p "$tmp_w/x"; tar -xzf "$tmp_w/Antigravity-IDE.tar.gz" -C "$tmp_w/x"
+                        local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; [ -z "$pd" ] && pd="$tmp_w/x"
+                        if [ -f "$pd/antigravity-ide" ] || [ -f "$pd/antigravity" ]; then
+                            rm -rf "$antigravity_ide_dir"; mkdir -p "$antigravity_ide_dir"; mv "$pd"/* "$antigravity_ide_dir/"
+                            [ -f "$antigravity_ide_dir/antigravity-ide" ] && chmod +x "$antigravity_ide_dir/antigravity-ide"
+                            [ -f "$antigravity_ide_dir/antigravity" ]     && chmod +x "$antigravity_ide_dir/antigravity"
+                            echo "$latest_ide" > "$antigravity_ide_dir/.version"
+                            _ensure_antigravity_ide_launchers
+                            log_ok "Antigravity IDE updated to $latest_ide."
+                            if [ "$was_running" = "true" ]; then
+                                restart_app "Antigravity IDE" "antigravity-ide" "$antigravity_ide_dir/antigravity-ide --no-sandbox"
+                            fi
+                        fi
+                    fi
+                    rm -rf "$tmp_w"
+                fi
             fi
         fi
     fi
 
-    # 16. Agy CLI
+    # 17. Agy CLI
     step "Core: Agy CLI"
-    if is_cli_running "agy"; then
-        echo -e "  ${YELLOW}[SKIP] Agy is active; skipping update.${RESET}"
-    elif ! command -v agy &>/dev/null; then
+    if ! command -v agy &>/dev/null; then
         log_bootstrap "Installing Agy CLI..."; npm install -g @google/agy 2>/dev/null || true
+    elif is_cli_running "agy"; then
+        if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+            echo -e "  ${YELLOW}[SKIP] Agy is active; skipping update (use --force to update).${RESET}"
+        else
+            log_info "Updating Agy CLI (--force)..."
+            agy update 2>/dev/null || npm install -g @google/agy 2>/dev/null || true
+            log_ok "Agy CLI up to date."
+        fi
     else
         agy update 2>/dev/null || true; log_ok "Agy CLI up to date."
     fi
 
-    # 17. Herdr CLI
+    # 18. Herdr CLI
     step "Core: Herdr CLI"
-    if is_cli_running "herdr"; then
-        echo -e "  ${YELLOW}[SKIP] Herdr is active; skipping update.${RESET}"
-    elif ! command -v herdr &>/dev/null; then
+    if ! command -v herdr &>/dev/null; then
         log_bootstrap "Installing Herdr CLI..."; curl -fsSL https://herdr.dev/install.sh | bash 2>/dev/null || true
     else
         local cv_h; cv_h="$(herdr --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
         local lv_h; lv_h="$(curl -s --max-time 3 'https://herdr.dev/latest.json' 2>/dev/null | grep -m1 '"version":' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
         if [ -n "$cv_h" ] && [ -n "$lv_h" ] && [ "$cv_h" = "$lv_h" ]; then
             log_ok "Herdr up to date ($cv_h)."
+        elif is_cli_running "herdr"; then
+            if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+                echo -e "  ${YELLOW}[SKIP] Herdr is active; skipping update (use --force to update).${RESET}"
+            else
+                log_info "Updating Herdr CLI with session handoff (--force)..."
+                herdr update --handoff 2>/dev/null || herdr update 2>/dev/null || true
+                log_ok "Herdr updated to ${lv_h:-latest}."
+            fi
         else
             log_info "Updating Herdr CLI..."; herdr update 2>/dev/null || true
+            log_ok "Herdr updated to ${lv_h:-latest}."
         fi
     fi
 
-    # 18. Syncthing
+    # 19. Syncthing
     step "Core: Syncthing Sync Engine"
     ! command -v syncthing &>/dev/null && { log_bootstrap "Installing Syncthing..."; sudo dnf install -y syncthing 2>/dev/null || true; }
     if command -v syncthing &>/dev/null; then
@@ -778,10 +1262,16 @@ run_ai_runtimes() {
     # Claude Code
     if command -v claude &>/dev/null; then
         step "AI: Claude Code CLI"
-        if is_cli_running "claude"; then
-            echo -e "  ${YELLOW}[SKIP] Claude Code is active; skipping update.${RESET}"
-        elif [ "${_NPM_GLOBAL_SYNCED:-false}" = "true" ] && [[ "$(command -v claude 2>/dev/null || true)" == *".npm-global"* ]]; then
+        if [ "${_NPM_GLOBAL_SYNCED:-false}" = "true" ] && [[ "$(command -v claude 2>/dev/null || true)" == *".npm-global"* ]]; then
             log_ok "Claude Code verified (synced via NPM global)."
+        elif is_cli_running "claude"; then
+            if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+                echo -e "  ${YELLOW}[SKIP] Claude Code is active; skipping update (use --force to update).${RESET}"
+            else
+                log_info "Updating Claude Code CLI (--force)..."
+                claude update || log_warn "Claude update had issues, continuing..."
+                log_ok "Claude Code updated."
+            fi
         else
             log_action "Checking Claude Code version..."
             claude update || log_warn "Claude update had issues, continuing..."
@@ -865,9 +1355,30 @@ run_dev_toolchains() {
     if command -v code &>/dev/null; then
         step "Dev: Visual Studio Code extensions"
         log_action "Checking Visual Studio Code extensions..."
-        is_vscode_running \
-            && echo -e "  ${YELLOW}[SKIP] VS Code is running; skipping extension updates.${RESET}" \
-            || { code --update-extensions --force || log_warn "VS Code extension update had issues, continuing..."; log_ok "VS Code extensions updated."; }
+        local was_running=false
+        local proceed=true
+        if is_vscode_running; then
+            if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+                echo -e "  ${YELLOW}[SKIP] VS Code is running; skipping extension updates (use --force to restart).${RESET}"
+                proceed=false
+            elif ! safe_stop_app "Visual Studio Code" get_vscode_pids is_vscode_running; then
+                proceed=false
+            else
+                was_running=true
+            fi
+        fi
+        if [ "$proceed" = "true" ]; then
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+                log_info "[DRY-RUN] Would update Visual Studio Code extensions..."
+                [ "$was_running" = "true" ] && restart_app "Visual Studio Code" "code" "code"
+            else
+                code --update-extensions --force || log_warn "VS Code extension update had issues, continuing..."
+                log_ok "VS Code extensions updated."
+                if [ "$was_running" = "true" ]; then
+                    restart_app "Visual Studio Code" "code" "code"
+                fi
+            fi
+        fi
     else skip_step "Visual Studio Code" "not installed"; fi
 
     # Agent Skills
@@ -1001,12 +1512,23 @@ run_cleanup() {
             log_ok "No services require restart."
         fi
     fi
+
+    # Desktop Shell Health Check (detect post-update icon/theme/D-Bus churn leaks)
+    if pgrep -x "plasmashell" &>/dev/null; then
+        local plasma_rss
+        plasma_rss=$(ps -o rss= -C plasmashell 2>/dev/null | awk '{s+=$1} END {print s}')
+        if [ -n "$plasma_rss" ] && [ "$plasma_rss" -gt 1572864 ]; then
+            log_warn "Plasmashell RSS elevated after updates ($((plasma_rss / 1024)) MB); reloading desktop shell..."
+            systemctl --user restart plasma-plasmashell.service 2>/dev/null || true
+            log_ok "Desktop shell refreshed."
+        fi
+    fi
 }
 
 ###############################################################################
 # CLI FLAGS & ARGUMENT PARSING
 ###############################################################################
-DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; export DRY_RUN
+DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; FORCE_UPDATE=false; export DRY_RUN FORCE_UPDATE
 
 usage() {
     cat <<EOF
@@ -1015,6 +1537,7 @@ Usage: $(basename "$0") [OPTIONS]
 Fedora Fleet Maintenance & Toolchain Sync Suite.
 
 Options:
+  --force, -f      Close running apps to apply updates, then restart them
   --trim           Also perform SSD TRIM (fstrim -av)
   --only=MODULE    Run only one section: core|dnf|flatpak|firmware|ai|dev|git|self|cleanup
   --skip=MODULES   Skip sections; comma-separated or repeated
@@ -1031,6 +1554,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --force|-f)   FORCE_UPDATE=true; shift ;;
         --trim)       DO_TRIM=true; shift ;;
         --only=*)     ONLY_MODULE="${1#*=}"; shift ;;
         --skip=*)     IFS=',' read -ra _sk <<< "${1#*=}"; SKIP_MODULES+=("${_sk[@]}"); shift ;;
@@ -1070,6 +1594,7 @@ main() {
     local START_TIME; START_TIME=$(date +%s)
 
     [ "$DRY_RUN" = "true" ] && echo -e "${BOLD}${YELLOW}============================================================\n   DRY-RUN MODE — No system changes will be made\n============================================================${RESET}\n"
+    [ "$FORCE_UPDATE" = "true" ] && echo -e "${BOLD}${MAGENTA}============================================================\n   FORCE MODE — Running apps will be closed for updates & restarted\n============================================================${RESET}\n"
 
     echo -e "${BOLD}${CYAN}============================================================${RESET}"
     echo -e "${BOLD}${CYAN}          Starting Fedora Fleet Maintenance Suite           ${RESET}"
@@ -1091,7 +1616,7 @@ main() {
     ensure_passwordless_sudo
 
     TOTAL_STEPS=0
-    should_run "core"     && TOTAL_STEPS=$((TOTAL_STEPS + 18))
+    should_run "core"     && TOTAL_STEPS=$((TOTAL_STEPS + 19))
     should_run "dnf"      && TOTAL_STEPS=$((TOTAL_STEPS + 3))
     should_run "flatpak"  && TOTAL_STEPS=$((TOTAL_STEPS + 2))
     should_run "firmware" && TOTAL_STEPS=$((TOTAL_STEPS + 1))

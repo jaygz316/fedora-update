@@ -29,7 +29,8 @@ update-all          # Same + SSD TRIM (fstrim -av)
 ### Options
 
 ```bash
-update --dry-run                   # Preview all steps, no system changes
+update --force, -f                 # Safely close running apps for updates, then restart them
+update --dry-run, -n               # Preview all steps, no system changes
 update --only=core                 # Run only one section
 update --skip=dnf,flatpak          # Skip sections (comma-separated)
 update --skip=dnf --skip=flatpak   # Skip sections (repeated flag)
@@ -40,7 +41,7 @@ update --trim                      # Include SSD TRIM step
 
 | Key       | What it does |
 | :-------- | :--- |
-| `core`    | Installs/updates all baseline tools on every node (pip, uv, Rust, Bun, Go, Docker, Android SDK, Antigravity, Agy, Herdr, Syncthing) |
+| `core`    | Installs/updates all baseline tools on every node (Node.js, npm, pip, uv, Rust, Bun, Go, Docker, Android SDK, Antigravity, Agy, Herdr, Syncthing) |
 | `dnf`     | DNF system upgrade, autoremove, cache clean |
 | `flatpak` | Flatpak app + runtime updates, prune unused |
 | `firmware`| LVFS hardware firmware checks (fwupdmgr) |
