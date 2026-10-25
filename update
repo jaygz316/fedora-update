@@ -1,18 +1,1290 @@
 #!/usr/bin/env bash
+# update — Fedora Fleet Maintenance & Toolchain Sync Suite
 #
-# update: Standalone 1-click routine system update & toolchain sync utility
-# Location: ~/.local/bin/update or ~/projects/update/fedora-update/update
+# Keeps a fleet of Fedora machines fully updated with one command.
+# Synced across machines via Syncthing (~/.gemini, ~/projects/).
 #
+# Usage: update [OPTIONS]
+#   --force, -f      Close running apps to apply updates, then restart them
+#   --trim           Also perform SSD TRIM (fstrim -av)
+#   --only=MODULE    Run only one section: core|dnf|flatpak|snap|firmware|ai|dev|git|self|cleanup
+#   --skip=MODULES   Skip sections; comma-separated or repeated flag
+#   --dry-run, -n    Preview steps without making system changes
+#   -h, --help       Show this help
+#
+# Run order: core -> dnf -> flatpak -> snap -> firmware -> ai -> dev -> git -> self -> cleanup
 
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+[ -z "$SCRIPT_PATH" ] && SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+ARCH="$(uname -m)"
 
-if [ -f "$SCRIPT_DIR/bin/fedora-update" ]; then
-    exec "$SCRIPT_DIR/bin/fedora-update" "$@"
-elif [ -f "$HOME/projects/update/fedora-update/bin/fedora-update" ]; then
-    exec "$HOME/projects/update/fedora-update/bin/fedora-update" "$@"
-else
-    echo "Error: fedora-update engine not found." >&2
-    exit 1
+###############################################################################
+# PATH — all user toolchain binaries available on any node
+###############################################################################
+export PNPM_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
+for _dir in \
+    "$HOME/.local/bin" "$HOME/bin" "$HOME/.cargo/bin" "$HOME/.bun/bin" \
+    "$HOME/.npm-global/bin" "$PNPM_HOME" "$PNPM_HOME/bin" \
+    "$HOME/.lmstudio/bin" "$HOME/google-cloud-sdk/bin" \
+    "$HOME/go/bin" "$HOME/Android/Sdk/cmdline-tools/latest/bin" \
+    "$HOME/Android/Sdk/platform-tools" "$HOME/Android/Sdk/emulator" \
+    "/opt/android-studio-preview/bin" "$HOME/.local/opt/android-studio-preview/bin"
+do
+    [ -d "$_dir" ] && [[ ":$PATH:" != *":$_dir:"* ]] && PATH="$_dir:$PATH"
+done
+export PATH
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env" 2>/dev/null || true
+if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    \. "$NVM_DIR/nvm.sh" 2>/dev/null || true
 fi
+
+###############################################################################
+# COLORS & ENVIRONMENT
+###############################################################################
+BOLD="\033[1m"; GREEN="\033[0;32m"; YELLOW="\033[0;33m"
+RED="\033[0;31m"; CYAN="\033[0;36m"; MAGENTA="\033[0;35m"; RESET="\033[0m"
+export PYTHONUNBUFFERED=1 GIT_TERMINAL_PROMPT=0 FORCE_COLOR=1 CLICOLOR_FORCE=1
+_NPM_GLOBAL_SYNCED=false
+
+###############################################################################
+# STEP COUNTER & LOGGING HELPERS
+###############################################################################
+STEP_COUNT=0; TOTAL_STEPS=0; _SUDO_KEEPALIVE_PID=""; _STEP_START_TIME=0
+
+format_duration() {
+    local s="$1"
+    if [ "$s" -ge 60 ]; then
+        echo "$((s / 60))m $((s % 60))s"
+    else
+        echo "${s}s"
+    fi
+}
+
+step() {
+    STEP_COUNT=$((STEP_COUNT + 1))
+    _STEP_START_TIME=$(date +%s)
+    [ "$TOTAL_STEPS" -gt 0 ] \
+        && echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}/${TOTAL_STEPS}] $1...${RESET}" \
+        || echo -e "\n${BOLD}${GREEN}[+] [${STEP_COUNT}] $1...${RESET}"
+}
+
+skip_step() {
+    STEP_COUNT=$((STEP_COUNT + 1))
+    local title="$1" reason="${2:-not found}"
+    [ "$TOTAL_STEPS" -gt 0 ] \
+        && echo -e "\n${YELLOW}[-] [${STEP_COUNT}/${TOTAL_STEPS}] ${title} (${reason}, skipping)${RESET}" \
+        || echo -e "\n${YELLOW}[-] [${STEP_COUNT}] ${title} (${reason}, skipping)${RESET}"
+}
+
+log_substep()  { echo -e "  ${BOLD}${CYAN}--> [$1/$2]${RESET} $3"; }
+log_action()   { echo -e "  ${CYAN}... $1${RESET}"; }
+log_info()     { echo -e "  ${BOLD}[*] $1${RESET}"; }
+log_ok()       {
+    if [ "$_STEP_START_TIME" -gt 0 ]; then
+        local elapsed=$(( $(date +%s) - _STEP_START_TIME ))
+        if [ "$elapsed" -ge 3 ]; then
+            echo -e "  ${GREEN}[OK] $1 ${CYAN}(took $(format_duration "$elapsed"))${RESET}"
+            _STEP_START_TIME=0
+            return
+        fi
+    fi
+    echo -e "  ${GREEN}[OK] $1${RESET}"
+    _STEP_START_TIME=0
+}
+log_warn()     { echo -e "  ${YELLOW}^ WARNING: $1${RESET}"; }
+log_err()      { echo -e "  ${RED}^ ERROR: $1${RESET}"; }
+log_bootstrap(){ echo -e "  ${BOLD}${MAGENTA}--> [BOOTSTRAP] $1${RESET}"; }
+
+run_or_dry() {
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo -e "  ${MAGENTA}[DRY-RUN] Would run: $*${RESET}"; return 0
+    fi
+    if [ "${1:-}" = "sudo" ] && { [ "${2:-}" = "dnf" ] || [ "${2:-}" = "rpm" ]; }; then
+        with_rpm_lock "$@"
+    else
+        "$@"
+    fi
+}
+
+run_silent_log() {
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo -e "  ${MAGENTA}[DRY-RUN] Would run: $*${RESET}"; return 0
+    fi
+    local target_log="${RECIPE_LOG_FILE:-$LOG_FILE}"
+    if [ "${1:-}" = "sudo" ] && { [ "${2:-}" = "dnf" ] || [ "${2:-}" = "rpm" ]; }; then
+        with_rpm_lock "$@" >> "$target_log" 2>&1
+    else
+        "$@" >> "$target_log" 2>&1
+    fi
+}
+
+with_rpm_lock() {
+    local lock_file="/tmp/fedora-update-rpm-${UID:-$(id -u)}.lock"
+    if command -v flock &>/dev/null; then
+        flock -w 600 "$lock_file" "$@"
+    else
+        "$@"
+    fi
+}
+
+###############################################################################
+# LOGGING — tee to timestamped log + ~/.local/state/update/last-update.log
+###############################################################################
+init_logging() {
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/update"
+    mkdir -p "$log_dir"
+    LOG_FILE="$log_dir/update_$(date +%Y%m%d_%H%M%S).log"
+    LAST_LOG_FILE="$log_dir/last-update.log"
+    : > "$LOG_FILE"
+    ln -sfn "$LOG_FILE" "$LAST_LOG_FILE" 2>/dev/null || : > "$LAST_LOG_FILE"
+    find "$log_dir" -name "update_*.log" -type f 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -f
+    exec 3>&1
+    exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+###############################################################################
+# PASSWORDLESS SUDO & POLKIT AUTO-SETUP
+###############################################################################
+ensure_passwordless_sudo() {
+    ! command -v sudo &>/dev/null && { log_warn "'sudo' not found."; return 0; }
+    local sudoers_file="/etc/sudoers.d/$USER"
+    local polkit_rule="/etc/polkit-1/rules.d/49-nopasswd-fedora-update.rules"
+
+    _write_polkit_rule() {
+        [ -d "/etc/polkit-1/rules.d" ] && [ ! -f "$polkit_rule" ] || return 0
+        sudo tee "$polkit_rule" >/dev/null <<EOF
+polkit.addRule(function(action, subject) {
+    if (subject.user == "$USER" || subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+        sudo chmod 0644 "$polkit_rule" 2>/dev/null || true
+    }
+
+    if sudo -n true 2>/dev/null; then
+        _write_polkit_rule
+        log_ok "Passwordless sudo & Polkit verified."
+    else
+        echo -e "\n${BOLD}${CYAN}------------------------------------------------------------${RESET}"
+        echo -e "${CYAN}  Configuring passwordless sudo for 1-click runs...${RESET}"
+        echo -e "${BOLD}${CYAN}------------------------------------------------------------${RESET}"
+        if [ -t 0 ] || [ -e /dev/tty ]; then
+            if sudo -v; then
+                echo "$USER ALL=(ALL:ALL) NOPASSWD: ALL" | sudo tee "$sudoers_file" >/dev/null
+                sudo chmod 0440 "$sudoers_file"; sudo chown root:root "$sudoers_file" 2>/dev/null || true
+                _write_polkit_rule
+                sudo -n true 2>/dev/null \
+                    && log_ok "Passwordless sudo configured for $USER." \
+                    || log_warn "Configured rules but validation returned non-zero."
+            else
+                log_warn "Authentication failed. Privileged operations may prompt."
+            fi
+        else
+            log_warn "Non-interactive session. Run 'update' in a terminal once to finish setup."
+        fi
+    fi
+
+    # Keep sudo ticket alive for the duration of the run
+    if sudo -n true 2>/dev/null; then
+        while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done </dev/null >/dev/null 2>&1 &
+        _SUDO_KEEPALIVE_PID=$!
+        trap '[ -n "$_SUDO_KEEPALIVE_PID" ] && kill -9 "$_SUDO_KEEPALIVE_PID" $(pgrep -P "$_SUDO_KEEPALIVE_PID" 2>/dev/null || true) 2>/dev/null || true' EXIT
+    fi
+}
+
+###############################################################################
+# PROCESS DETECTION & SAFE SHUTDOWN / RESTART
+###############################################################################
+_is_process_excluded() {
+    local pid="$1"
+    { [ "$pid" = "$$" ] || [ "$pid" = "${PPID:-0}" ] || [ "$pid" = "${BASHPID:-$$}" ]; } && return 0
+    local comm; comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    case "$comm" in pgrep|grep|bash|sh|zsh) return 0 ;; esac
+    local cmdline; cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+    [[ "$cmdline" == *"telemetry_hook_bundle.js"* || "$cmdline" == *"fedora-update"* ]] && return 0
+    return 1
+}
+
+_is_ancestor_process() {
+    local target_pid="$1"
+    local cur="$$"
+    while [ -n "$cur" ] && [ "$cur" -gt 0 ] 2>/dev/null; do
+        [ "$cur" = "$target_pid" ] && return 0
+        cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ' || true)
+        [ -z "$cur" ] || [ "$cur" = "0" ] && break
+    done
+    return 1
+}
+
+get_android_studio_pids() {
+    local pids; pids="$(pgrep -f 'com.intellij.idea.Main|/android-studio' 2>/dev/null || true)"
+    if [ -z "$pids" ]; then
+        pids="$(pgrep -x "studio.sh" 2>/dev/null || true; pgrep -x "studio64" 2>/dev/null || true; pgrep -x "studio" 2>/dev/null || true)"
+    fi
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        local c; c=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+        [[ "$c" == *"android-studio"* || "$c" == *"com.intellij.idea.Main"* || "$c" == *"studio.sh"* || "$c" == *"studio"* ]] && valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_antigravity_desktop_pids() {
+    local pids; pids="$(pgrep -x antigravity 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        local c; c=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+        [[ ("$c" == *"/opt/antigravity/antigravity"* || "$c" == *"/.local/opt/antigravity/antigravity"*) && "$c" != *"antigravity-cli"* && "$c" != *"antigravity-ide"* ]] && valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_antigravity_ide_pids() {
+    local pids; pids="$(pgrep -x antigravity-ide 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_vscode_pids() {
+    local pids; pids="$(pgrep -x code 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_cli_pids() {
+    local name="$1"
+    local pids; pids="$(pgrep -x "$name" 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        if [ "$name" = "herdr" ]; then
+            local c; c=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
+            [[ "$c" == *"server"* ]] && continue
+        fi
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_rustdesk_session_pids() {
+    local pids; pids="$(pgrep -x rustdesk 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        local c; c="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        case "$c" in
+            *"--service"*|*"--server"*|*"--tray"*|*"--check-hwcodec-config"*) continue ;;
+        esac
+        [ -n "$c" ] && valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_nvbroadcast_pids() {
+    local pids; pids="$(pgrep -f '^/opt/nvbroadcast/\.venv/bin/python' 2>/dev/null || true; pgrep -x nvbroadcast 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_openlogi_pids() {
+    local pids; pids="$(pgrep -x openlogi-desktop 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+get_claude_desktop_pids() {
+    local pids; pids="$(pgrep -x claude-desktop 2>/dev/null || true)"
+    local valid_pids=()
+    for pid in $pids; do
+        _is_process_excluded "$pid" && continue
+        local c; c="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        [[ "$c" == *"chrome-native-host"* ]] && continue
+        [ -n "$c" ] && valid_pids+=("$pid")
+    done
+    echo "${valid_pids[@]}"
+}
+
+is_android_studio_running()      { [ -n "$(get_android_studio_pids)" ]; }
+is_antigravity_desktop_running() { [ -n "$(get_antigravity_desktop_pids)" ]; }
+is_antigravity_ide_running()     { [ -n "$(get_antigravity_ide_pids)" ]; }
+is_vscode_running()              { [ -n "$(get_vscode_pids)" ]; }
+is_rustdesk_session_running()    { [ -n "$(get_rustdesk_session_pids)" ]; }
+is_nvbroadcast_running()         { [ -n "$(get_nvbroadcast_pids)" ]; }
+is_openlogi_running()            { [ -n "$(get_openlogi_pids)" ]; }
+is_claude_desktop_running()      { [ -n "$(get_claude_desktop_pids)" ]; }
+is_cli_running()                 { [ -n "$(get_cli_pids "$1")" ]; }
+
+safe_stop_app() {
+    local app_name="$1"
+    local pids_fn="$2"
+    local check_fn="$3"
+
+    local pids; pids="$($pids_fn)"
+    [ -z "$pids" ] && return 0
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log_info "[DRY-RUN] Would safely shut down $app_name (PIDs: $pids), apply update, and restart."
+        return 0
+    fi
+
+    # Ancestor protection: ensure none of the PIDs are ancestors of this script ($$)
+    for pid in $pids; do
+        if _is_ancestor_process "$pid"; then
+            log_warn "$app_name (PID $pid) is an ancestor of this update process; skipping shutdown to protect current session."
+            return 1
+        fi
+    done
+
+    log_action "Sending graceful shutdown signal (SIGTERM) to $app_name..."
+
+    # Identify root PIDs (whose parent is NOT in $pids)
+    local root_pids=()
+    for pid in $pids; do
+        local ppid; ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+        if [[ ! " $pids " =~ " $ppid " ]]; then
+            root_pids+=("$pid")
+        fi
+    done
+    [ "${#root_pids[@]}" -eq 0 ] && root_pids=($pids)
+
+    for pid in "${root_pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    local waited=0
+    while "$check_fn" && [ "$waited" -lt 10 ]; do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+
+    if "$check_fn"; then
+        local remaining; remaining="$($pids_fn)"
+        for pid in $remaining; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        while "$check_fn" && [ "$waited" -lt 30 ]; do
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+    fi
+
+    if "$check_fn"; then
+        log_warn "$app_name did not terminate cleanly within 15s; sending SIGKILL..."
+        local remaining; remaining="$($pids_fn)"
+        for pid in $remaining; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+
+    if "$check_fn"; then
+        log_err "Failed to stop $app_name; skipping update."
+        return 1
+    fi
+
+    log_ok "$app_name shut down safely."
+    return 0
+}
+
+restart_app() {
+    local app_name="$1"
+    local desktop_id="$2"
+    local fallback_cmd="$3"
+    local check_fn="${4:-}"
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log_info "[DRY-RUN] Would restart $app_name."
+        return 0
+    fi
+
+    log_info "Restarting $app_name..."
+
+    # Ensure desktop display environment is restored if run headless / via SSH
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        local _xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        if [ -d "$_xdg" ]; then
+            export XDG_RUNTIME_DIR="$_xdg"
+            local _env
+            _env="$(systemctl --user show-environment 2>/dev/null | grep -E '^(DISPLAY|WAYLAND_DISPLAY|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP)=')"
+            [ -n "$_env" ] && eval "export $_env"
+        fi
+    fi
+
+    _wait_for_restart() {
+        [ -z "$check_fn" ] && return 0
+        local waited=0
+        while ! "$check_fn" && [ "$waited" -lt 6 ]; do
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+        "$check_fn"
+    }
+
+    # Strategy 1: Systemd user autostart service (e.g. app-antigravity@autostart.service)
+    if systemctl --user cat "app-${desktop_id}@autostart.service" &>/dev/null; then
+        if systemctl --user start "app-${desktop_id}@autostart.service" 2>/dev/null; then
+            if _wait_for_restart; then
+                log_ok "$app_name restarted via systemd autostart service."
+                return 0
+            fi
+        fi
+    fi
+
+    # Strategy 2: Desktop launcher via gtk-launch
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v gtk-launch &>/dev/null; then
+        if gtk-launch "$desktop_id" 2>/dev/null; then
+            if _wait_for_restart; then
+                log_ok "$app_name restarted via desktop launcher."
+                return 0
+            fi
+        fi
+    fi
+
+    # Strategy 3: Fallback background execution
+    if [ -n "$fallback_cmd" ]; then
+        nohup bash -c "$fallback_cmd" >> "${LOG_FILE:-/dev/null}" 2>&1 &
+        disown 2>/dev/null || true
+        if _wait_for_restart; then
+            log_ok "$app_name restarted in background."
+            return 0
+        fi
+    fi
+
+    if [ -n "$check_fn" ] && ! "$check_fn"; then
+        log_warn "$app_name launch attempted, but process did not stay running."
+    else
+        log_warn "Could not restart $app_name (no launcher or command available)."
+    fi
+    return 1
+}
+
+fast_download() {
+    local url="$1"
+    local dest="$2"
+    if command -v aria2c &>/dev/null; then
+        aria2c -x 16 -s 16 -k 1M --file-allocation=none --console-log-level=error --summary-interval=0 \
+            --allow-overwrite=true -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url" >> "${RECIPE_LOG_FILE:-${LOG_FILE:-/dev/null}}" 2>&1 \
+            && [ -s "$dest" ] && return 0
+    fi
+    curl -fSL -sS -o "$dest" "$url" 2>> "${RECIPE_LOG_FILE:-${LOG_FILE:-/dev/null}}"
+}
+
+sync_tar_app() {
+    local app_name="$1"
+    local target_dir="$2"
+    local download_url="$3"
+    local latest_ver="$4"
+    local current_ver="$5"
+    local pids_fn="$6"
+    local check_fn="$7"
+    local desktop_id="$8"
+    local fallback_cmd="$9"
+    local launcher_fn="${10:-}"
+    local priv_mode="${11:-user}"
+
+    local was_running=false
+    local proceed=true
+    if "$check_fn"; then
+        if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+            echo -e "  ${YELLOW}[SKIP] $app_name is running; skipping update (use --force to restart).${RESET}"
+            [ -n "$launcher_fn" ] && "$launcher_fn"
+            return 0
+        elif ! safe_stop_app "$app_name" "$pids_fn" "$check_fn"; then
+            [ -n "$launcher_fn" ] && "$launcher_fn"
+            return 1
+        else
+            was_running=true
+        fi
+    fi
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log_info "[DRY-RUN] Would update $app_name (${current_ver:-none} -> $latest_ver)..."
+        [ -n "$launcher_fn" ] && "$launcher_fn"
+        [ "$was_running" = "true" ] && restart_app "$app_name" "$desktop_id" "$fallback_cmd" "$check_fn"
+        return 0
+    fi
+
+    log_info "Updating $app_name (${current_ver:-none} -> $latest_ver)..."
+    log_action "Downloading $app_name archive ($latest_ver)..."
+    local tmp_w; tmp_w="$(mktemp -d -t "app-update-XXXXXX")"
+    local archive_file="$tmp_w/app.tar.gz"
+
+    if fast_download "$download_url" "$archive_file"; then
+        log_action "Extracting and installing to $target_dir..."
+        mkdir -p "$tmp_w/x"
+        if tar -xzf "$archive_file" -C "$tmp_w/x"; then
+            local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+            [ -z "$pd" ] && pd="$tmp_w/x"
+            if [ "$priv_mode" = "sudo" ]; then
+                sudo mkdir -p "$target_dir"
+                sudo find "$target_dir" -mindepth 1 -delete 2>/dev/null || true
+                sudo mv "$pd"/* "$target_dir/"
+                sudo chown -R "$(id -u):$(id -g)" "$target_dir" 2>/dev/null || true
+            else
+                rm -rf "$target_dir"
+                mkdir -p "$target_dir"
+                mv "$pd"/* "$target_dir/"
+            fi
+            echo "$latest_ver" > "$target_dir/.version" 2>/dev/null || sudo bash -c "echo '$latest_ver' > '$target_dir/.version'"
+            [ -n "$launcher_fn" ] && "$launcher_fn"
+            log_ok "$app_name updated to $latest_ver."
+            if [ "$was_running" = "true" ]; then
+                restart_app "$app_name" "$desktop_id" "$fallback_cmd" "$check_fn"
+            fi
+        else
+            log_warn "Failed to extract $app_name archive."
+        fi
+    else
+        log_warn "Failed to download $app_name archive from $download_url"
+    fi
+    rm -rf "$tmp_w"
+}
+
+###############################################################################
+# GIT GUARD — Syncthing-safe git pull (skips on dirty working tree)
+###############################################################################
+safe_git_repo_update() {
+    local repo_path="$1"
+    local repo_name; repo_name="$(basename "$repo_path")"
+    [ ! -d "$repo_path" ] && { log_warn "$repo_name not found, skipping."; return 0; }
+    (
+        cd "$repo_path" || return 1
+        git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_warn "$repo_name is not a git repo."; return 1; }
+        log_action "Inspecting $repo_name..."
+        export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15"
+        local dirty; dirty="$(git status --porcelain 2>/dev/null || true)"
+        if [ -n "$dirty" ]; then
+            echo -e "  ${YELLOW}[SKIP] Local changes in $repo_name; skipping pull to avoid Syncthing conflicts.${RESET}"
+            return 0
+        fi
+        log_action "Fetching upstream for $repo_name..."
+        timeout 45s git fetch --all --prune 2>/dev/null || { log_warn "Fetch timed out for $repo_name."; return 0; }
+        local local_c upstream_c
+        local_c="$(git rev-parse HEAD 2>/dev/null || true)"
+        upstream_c="$(git rev-parse '@{u}' 2>/dev/null || true)"
+        if [ -n "$local_c" ] && [ -n "$upstream_c" ] && [ "$local_c" = "$upstream_c" ]; then
+            log_ok "$repo_name is already up to date."
+        elif [ "${DRY_RUN:-false}" = "true" ]; then
+            log_info "[DRY-RUN] Would pull upstream changes into $repo_name"
+        else
+            log_info "Pulling upstream changes into $repo_name..."
+            timeout 60s git pull --rebase --autostash \
+                && log_ok "$repo_name synchronized." \
+                || log_warn "Pull/rebase failed for $repo_name."
+        fi
+    ) || log_warn "Git operation failed on $repo_path"
+}
+
+_update_or_install_go_tool() {
+    local bin_name="$1" install_path="$2"
+    local bin_path="$HOME/go/bin/$bin_name"
+    if [ -x "$bin_path" ]; then
+        local mod_line mod_path current_ver latest_ver
+        mod_line="$(go version -m "$bin_path" 2>/dev/null | grep -E "^\s*mod\s+" | head -n 1)"
+        mod_path="$(echo "$mod_line" | awk '{print $2}')"
+        current_ver="$(echo "$mod_line" | awk '{print $3}')"
+        if [ -n "$mod_path" ]; then
+            latest_ver="$(curl -s --max-time 3 "https://proxy.golang.org/$mod_path/@latest" 2>/dev/null | grep -o '"Version":"[^"]*"' | cut -d'"' -f4 || true)"
+        fi
+        if [ -n "$current_ver" ] && [ -n "$latest_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
+            log_ok "$bin_name already up to date ($current_ver)."; return 0
+        fi
+    fi
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        log_info "[DRY-RUN] Would install/update $bin_name ($install_path@latest)"
+        return 0
+    fi
+    log_info "Installing/updating $bin_name..."
+    if GOTOOLCHAIN=auto go install "$install_path@latest"; then
+        log_ok "$bin_name updated."
+    else
+        log_warn "Failed to update $bin_name."
+    fi
+}
+
+###############################################################################
+# CLI FLAGS & ARGUMENT PARSING
+###############################################################################
+DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; FORCE_UPDATE=false
+APP_MENU=false; declare -a APP_QUERIES=(); declare -a FORCE_TARGETS=(); declare -a SELECTED_RECIPES=()
+export DRY_RUN FORCE_UPDATE DO_TRIM
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Fedora Fleet Maintenance & Toolchain Sync Suite.
+
+Options:
+  --app, -a [APP]    Interactive menu to force-update specific app(s), or pass
+                     app name(s) directly (e.g. update --app rustdesk)
+  --force, -f        Close all running apps to apply updates, then restart them
+  --force=APPS       Run full suite, but only force-restart specified app(s)
+                     e.g. update --force=rustdesk,vscode
+  --trim             Also perform SSD TRIM (fstrim -av)
+  --only=MODULE      Run only one section: core|dnf|flatpak|snap|firmware|ai|dev|git|self|cleanup
+  --skip=MODULES     Skip sections; comma-separated or repeated
+                     e.g. --skip=dnf,flatpak  or  --skip=dnf --skip=flatpak
+  --dry-run, -n      Preview without making system changes
+  -h, --help         Show this help
+
+Commands:
+  update             Routine maintenance (skips active GUI/session apps)
+  update --app       Interactive menu to force-update specific app(s)
+  update --app NAME  Immediately force-update only NAME (e.g. update -a rustdesk)
+  update-all         Routine maintenance + SSD TRIM
+EOF
+    exit 0
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --app|-a)
+            if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
+                IFS=',' read -ra _aq <<< "$2"
+                APP_QUERIES+=("${_aq[@]}")
+                shift 2
+            else
+                APP_MENU=true
+                shift
+            fi
+            ;;
+        --app=*)
+            _val="${1#*=}"
+            if [ -n "$_val" ]; then
+                IFS=',' read -ra _aq <<< "$_val"
+                APP_QUERIES+=("${_aq[@]}")
+            else
+                APP_MENU=true
+            fi
+            shift
+            ;;
+        --force|-f)
+            if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
+                IFS=',' read -ra _ft <<< "$2"
+                FORCE_TARGETS+=("${_ft[@]}")
+                shift 2
+            else
+                FORCE_UPDATE=true
+                shift
+            fi
+            ;;
+        --force=*)
+            _fval="${1#*=}"
+            if [ -n "$_fval" ]; then
+                IFS=',' read -ra _ft <<< "$_fval"
+                FORCE_TARGETS+=("${_ft[@]}")
+            else
+                FORCE_UPDATE=true
+            fi
+            shift
+            ;;
+        --trim)       DO_TRIM=true; shift ;;
+        --only=*)     ONLY_MODULE="${1#*=}"; shift ;;
+        --skip=*)     IFS=',' read -ra _sk <<< "${1#*=}"; SKIP_MODULES+=("${_sk[@]}"); shift ;;
+        --dry-run|-n) DRY_RUN=true; shift ;;
+        -h|--help)    usage ;;
+        *)            shift ;;
+    esac
+done
+
+MODULE_ORDER=(core dnf flatpak snap firmware ai dev git self cleanup)
+MODULE_KEYS=(); MODULE_LABELS=(); MODULE_DURATIONS=()
+
+_recipe_slug() {
+    local base; base="$(basename "$1" .sh)"
+    echo "${base#[0-9][0-9]-}"
+}
+
+_recipe_title() {
+    local raw; raw="$(grep -m1 -E '^[[:space:]]*step "' "$1" 2>/dev/null | grep -oE 'step "[^"]+"' | cut -d'"' -f2 || true)"
+    if [ -n "$raw" ]; then
+        echo "${raw#*: }"
+    else
+        _recipe_slug "$1"
+    fi
+}
+
+_recipe_run_status() {
+    local slug="$1"
+    case "$slug" in
+        rustdesk)              is_rustdesk_session_running    && echo "running" || echo "idle" ;;
+        openlogi)              is_openlogi_running            && echo "running" || echo "idle" ;;
+        antigravity-desktop)   is_antigravity_desktop_running && echo "running" || echo "idle" ;;
+        antigravity-ide)       is_antigravity_ide_running     && echo "running" || echo "idle" ;;
+        android-studio-canary) is_android_studio_running      && echo "running" || echo "idle" ;;
+        nvbroadcast)           is_nvbroadcast_running         && echo "running" || echo "idle" ;;
+        claude-desktop)        is_claude_desktop_running      && echo "running" || echo "idle" ;;
+        vscode-extensions)     is_vscode_running              && echo "running" || echo "idle" ;;
+        agy-cli)               is_cli_running "agy"           && echo "running" || echo "idle" ;;
+        herdr-cli)             is_cli_running "herdr"         && echo "running" || echo "idle" ;;
+        claude-code)           is_cli_running "claude"        && echo "running" || echo "idle" ;;
+        *)                     echo "recipe" ;;
+    esac
+}
+
+_match_recipe_by_query() {
+    local q="$1"
+    local q_low="${q,,}"
+    local q_norm="${q_low//[-_ ]/}"
+
+    # Alias expansion for common shorthand names
+    case "$q_low" in
+        studio|android-studio) q_low="android-studio-canary"; q_norm="androidstudiocanary" ;;
+        vscode|code)           q_low="vscode-extensions";     q_norm="vscodeextensions" ;;
+        rust)                  q_low="rust-toolchain";        q_norm="rusttoolchain" ;;
+        claude-app|claudedesktop) q_low="claude-desktop";     q_norm="claudedesktop" ;;
+        claude-cli)            q_low="claude-code";           q_norm="claudecode" ;;
+        ollama)                q_low="ollama-models";         q_norm="ollamamodels" ;;
+        agy)                   q_low="agy-cli";               q_norm="agycli" ;;
+        herdr)                 q_low="herdr-cli";             q_norm="herdrcli" ;;
+    esac
+
+    local mod r slug title slug_norm title_norm base_low
+    # Pass 1: exact slug or mod/slug match
+    for mod in "${MODULE_ORDER[@]}"; do
+        local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
+        [ -d "$mod_dir" ] || continue
+        for r in "$mod_dir"/*.sh; do
+            [ -f "$r" ] || continue
+            slug="$(_recipe_slug "$r")"
+            base_low="$(basename "$r" .sh)"
+            slug_norm="${slug//[-_ ]/}"
+            if [ "$slug" = "$q_low" ] || [ "$slug_norm" = "$q_norm" ] || [ "$base_low" = "$q_low" ] || [ "$mod/$slug" = "$q_low" ] || [ "$mod/$base_low" = "$q_low" ]; then
+                echo "$r"
+                return 0
+            fi
+        done
+    done
+
+    # Pass 2: substring match against slug or title
+    local matches=()
+    for mod in "${MODULE_ORDER[@]}"; do
+        local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
+        [ -d "$mod_dir" ] || continue
+        for r in "$mod_dir"/*.sh; do
+            [ -f "$r" ] || continue
+            slug="$(_recipe_slug "$r")"
+            title="$(_recipe_title "$r")"
+            slug_norm="${slug,,}"; slug_norm="${slug_norm//[-_ ]/}"
+            title_norm="${title,,}"; title_norm="${title_norm//[-_ ]/}"
+            if [[ "$slug_norm" == *"$q_norm"* ]] || [[ "$title_norm" == *"$q_norm"* ]]; then
+                matches+=("$r")
+            fi
+        done
+    done
+
+    if [ "${#matches[@]}" -gt 0 ]; then
+        printf '%s\n' "${matches[@]}"
+        return 0
+    fi
+    return 1
+}
+
+_add_selected_recipe() {
+    local target="$1"
+    local existing
+    for existing in "${SELECTED_RECIPES[@]}"; do
+        [ "$existing" = "$target" ] && return 0
+    done
+    SELECTED_RECIPES+=("$target")
+}
+
+resolve_app_queries() {
+    local q matched
+    for q in "${APP_QUERIES[@]}"; do
+        [ -z "$q" ] && continue
+        if matched="$(_match_recipe_by_query "$q")"; then
+            while IFS= read -r r; do
+                [ -n "$r" ] && _add_selected_recipe "$r"
+            done <<< "$matched"
+        else
+            echo -e "${RED}^ ERROR: No app or recipe matching '$q'. Run 'update --app' to browse available targets.${RESET}" >&2
+            exit 1
+        fi
+    done
+    FORCE_UPDATE=true
+}
+
+select_apps_interactively() {
+    local tier_running=() tier_idle=() tier_other=()
+    local mod r slug title status entry
+
+    for mod in "${MODULE_ORDER[@]}"; do
+        local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
+        [ -d "$mod_dir" ] || continue
+        for r in "$mod_dir"/*.sh; do
+            [ -f "$r" ] || continue
+            slug="$(_recipe_slug "$r")"
+            title="$(_recipe_title "$r")"
+            status="$(_recipe_run_status "$slug")"
+            entry="${r}|${mod}|${slug}|${title}|${status}"
+            case "$status" in
+                running) tier_running+=("$entry") ;;
+                idle)    tier_idle+=("$entry") ;;
+                *)       tier_other+=("$entry") ;;
+            esac
+        done
+    done
+
+    local all_entries=("${tier_running[@]}" "${tier_idle[@]}" "${tier_other[@]}")
+    local display_lines=()
+    local idx=1
+    for entry in "${all_entries[@]}"; do
+        IFS='|' read -r r mod slug title status <<< "$entry"
+        local badge=""
+        case "$status" in
+            running) badge="$(printf "${YELLOW}[RUNNING]${RESET}")" ;;
+            idle)    badge="$(printf "${GREEN}[idle]   ${RESET}")" ;;
+            *)       badge="$(printf "${CYAN}[recipe] ${RESET}")" ;;
+        esac
+        display_lines+=("$(printf "%2d) %-44s %b  (%s/%s)" "$idx" "$title" "$badge" "$mod" "$slug")")
+        idx=$((idx + 1))
+    done
+
+    if command -v fzf &>/dev/null && [ -t 0 ] && [ -t 1 ] && [ "${UPDATE_NO_FZF:-0}" != "1" ]; then
+        local picked
+        picked="$(printf '%s\n' "${display_lines[@]}" | fzf \
+            --multi \
+            --ansi \
+            --height=~70% \
+            --layout=reverse \
+            --border=rounded \
+            --prompt="Force-Update App > " \
+            --header="↑/↓: Navigate  |  TAB: Select multiple  |  ENTER: Force-update  |  ESC: Cancel")" || {
+            echo -e "${YELLOW}Selection cancelled.${RESET}"
+            exit 0
+        }
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            local num; num="$(echo "$line" | awk -F')' '{gsub(/ /, "", $1); print $1}')"
+            if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "${#all_entries[@]}" ]; then
+                IFS='|' read -r r _ _ _ _ <<< "${all_entries[$((num - 1))]}"
+                _add_selected_recipe "$r"
+            fi
+        done <<< "$picked"
+    else
+        echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
+        echo -e "${BOLD}${CYAN}       Select Application(s) / Recipe(s) to Force-Update    ${RESET}"
+        echo -e "${BOLD}${CYAN}============================================================${RESET}"
+        printf '%s\n' "${display_lines[@]}"
+        echo -e "${CYAN}------------------------------------------------------------${RESET}"
+        printf "${BOLD}Enter number(s) or name(s) (e.g. 1, 1,3, rustdesk) [q to quit]: ${RESET}"
+        local reply=""
+        read -r reply || exit 0
+        [ -z "$reply" ] || [[ "${reply,,}" == "q" ]] || [[ "${reply,,}" == "quit" ]] && {
+            echo -e "${YELLOW}Selection cancelled.${RESET}"
+            exit 0
+        }
+        IFS=', ' read -ra tokens <<< "$reply"
+        for tok in "${tokens[@]}"; do
+            [ -z "$tok" ] && continue
+            if [[ "$tok" =~ ^[0-9]+$ ]] && [ "$tok" -ge 1 ] && [ "$tok" -le "${#all_entries[@]}" ]; then
+                IFS='|' read -r r _ _ _ _ <<< "${all_entries[$((tok - 1))]}"
+                _add_selected_recipe "$r"
+            else
+                APP_QUERIES+=("$tok")
+            fi
+        done
+        [ "${#APP_QUERIES[@]}" -gt 0 ] && resolve_app_queries
+    fi
+
+    if [ "${#SELECTED_RECIPES[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}No applications selected.${RESET}"
+        exit 0
+    fi
+    FORCE_UPDATE=true
+}
+
+_is_recipe_selected() {
+    local target="$1"
+    [ "${#SELECTED_RECIPES[@]}" -eq 0 ] && return 0
+    local r
+    for r in "${SELECTED_RECIPES[@]}"; do
+        [ "$r" = "$target" ] && return 0
+    done
+    return 1
+}
+
+_is_recipe_force_targeted() {
+    local target="$1"
+    [ "${#FORCE_TARGETS[@]}" -eq 0 ] && return 1
+    local q matched r
+    for q in "${FORCE_TARGETS[@]}"; do
+        if matched="$(_match_recipe_by_query "$q" 2>/dev/null)"; then
+            while IFS= read -r r; do
+                [ "$r" = "$target" ] && return 0
+            done <<< "$matched"
+        fi
+    done
+    return 1
+}
+
+should_run() {
+    local k="$1"
+    if [ "${#SELECTED_RECIPES[@]}" -gt 0 ]; then
+        local r
+        for r in "${SELECTED_RECIPES[@]}"; do
+            [[ "$r" == "$SCRIPT_DIR/recipes.d/$k/"* ]] && return 0
+        done
+        return 1
+    fi
+    [ -n "$ONLY_MODULE" ] && [ "$ONLY_MODULE" != "$k" ] && return 1
+    if [ "${#SKIP_MODULES[@]}" -gt 0 ]; then
+        local s; for s in "${SKIP_MODULES[@]}"; do [ "$s" = "$k" ] && return 1; done
+    fi
+    return 0
+}
+
+compute_total_steps() {
+    TOTAL_STEPS=0
+    for mod in "${MODULE_ORDER[@]}"; do
+        should_run "$mod" || continue
+        local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
+        [ -d "$mod_dir" ] || continue
+        for r in "$mod_dir"/*.sh; do
+            [ -f "$r" ] || continue
+            if [ "${#SELECTED_RECIPES[@]}" -gt 0 ]; then
+                _is_recipe_selected "$r" || continue
+            elif [ "$mod" = "cleanup" ] && [[ "$r" == *"trim"* ]] && [ "${DO_TRIM:-false}" != "true" ]; then
+                continue
+            fi
+            TOTAL_STEPS=$((TOTAL_STEPS + 1))
+        done
+    done
+}
+
+_run_single_recipe() {
+    local recipe="$1"
+    if ! bash -n "$recipe" 2>/dev/null; then
+        log_err "Syntax error in $recipe; skipping to protect suite."
+        return 0
+    fi
+    local _prev_force="$FORCE_UPDATE"
+    if [ "${#FORCE_TARGETS[@]}" -gt 0 ]; then
+        if _is_recipe_force_targeted "$recipe"; then
+            FORCE_UPDATE=true
+        else
+            FORCE_UPDATE=false
+        fi
+    fi
+    source "$recipe"
+    FORCE_UPDATE="$_prev_force"
+}
+
+# Stream a background job's buffered terminal output to fd 3 live, until the job and its tee finish
+_stream_job_output() {
+    local term="$1" done_file="$2" pid="$3"
+    local off=0 size finished=0 grace=0
+    while :; do
+        if [ -e "$done_file" ]; then
+            finished=1
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            # Job exited but its tee hasn't; a relaunched app may hold the pipe open, so don't wait forever
+            grace=$((grace + 1))
+            [ "$grace" -ge 8 ] && finished=1
+        fi
+        size="$(stat -c %s "$term" 2>/dev/null || echo 0)"
+        if [ "$size" -gt "$off" ]; then
+            tail -c +"$((off + 1))" "$term" | head -c "$((size - off))" >&3
+            off="$size"
+        fi
+        [ "$finished" -eq 1 ] && break
+        sleep 0.25
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
+_run_parallel_recipe_batch() {
+    local recipes=("$@")
+    local count="${#recipes[@]}"
+    [ "$count" -eq 0 ] && return 0
+
+    if [ "$count" -eq 1 ] || [ "${UPDATE_SEQUENTIAL:-0}" = "1" ]; then
+        local r
+        for r in "${recipes[@]}"; do
+            _run_single_recipe "$r"
+        done
+        return 0
+    fi
+
+    local batch_dir; batch_dir="$(mktemp -d -t update-batch-XXXXXX)"
+    local pids=()
+    local idx=0
+
+    for r in "${recipes[@]}"; do
+        idx=$((idx + 1))
+        STEP_COUNT=$((STEP_COUNT + 1))
+        local assigned_step="$STEP_COUNT"
+        local term_log="$batch_dir/${idx}.term"
+        local full_log="$batch_dir/${idx}.full"
+        local done_file="$batch_dir/${idx}.done"
+        (
+            STEP_COUNT=$((assigned_step - 1))
+            LOG_FILE="$full_log"
+            RECIPE_LOG_FILE="$full_log"
+            exec > >(tee -a "$full_log" >> "$term_log"; : > "$done_file") 2>&1
+            _run_single_recipe "$r"
+        ) &
+        pids+=($!)
+    done
+
+    # Stream each recipe's output in deterministic step order: the head recipe streams live,
+    # later ones buffer until their turn
+    local i
+    for i in $(seq 1 "$count"); do
+        _stream_job_output "$batch_dir/${i}.term" "$batch_dir/${i}.done" "${pids[$((i - 1))]}"
+        if [ -f "$batch_dir/${i}.full" ]; then
+            cat "$batch_dir/${i}.full" >> "$LOG_FILE"
+        fi
+    done
+
+    rm -rf "$batch_dir"
+}
+
+_count_module_active_recipes() {
+    local mod="$1"
+    local count=0
+    should_run "$mod" || { echo 0; return 0; }
+    local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
+    [ -d "$mod_dir" ] || { echo 0; return 0; }
+    local r
+    for r in "$mod_dir"/*.sh; do
+        [ -f "$r" ] || continue
+        if [ "${#SELECTED_RECIPES[@]}" -gt 0 ]; then
+            _is_recipe_selected "$r" || continue
+        elif [ "$mod" = "cleanup" ] && [[ "$r" == *"trim"* ]] && [ "${DO_TRIM:-false}" != "true" ]; then
+            continue
+        fi
+        count=$((count + 1))
+    done
+    echo "$count"
+}
+
+run_parallel_modules() {
+    # Pairs of "mod|label"
+    local pairs=("$@")
+    local active_pairs=()
+    local p mod lbl cnt
+    for p in "${pairs[@]}"; do
+        IFS='|' read -r mod lbl <<< "$p"
+        cnt="$(_count_module_active_recipes "$mod")"
+        [ "$cnt" -gt 0 ] && active_pairs+=("${mod}|${lbl}|${cnt}")
+    done
+
+    local num_active="${#active_pairs[@]}"
+    [ "$num_active" -eq 0 ] && return 0
+
+    if [ "$num_active" -eq 1 ] || [ "${UPDATE_SEQUENTIAL:-0}" = "1" ]; then
+        for p in "${active_pairs[@]}"; do
+            IFS='|' read -r mod lbl cnt <<< "$p"
+            run_module_recipes "$mod" "$lbl"
+        done
+        return 0
+    fi
+
+    local wave_dir; wave_dir="$(mktemp -d -t update-modwave-XXXXXX)"
+    local pids=()
+    local idx=0
+
+    for p in "${active_pairs[@]}"; do
+        idx=$((idx + 1))
+        IFS='|' read -r mod lbl cnt <<< "$p"
+        local start_step="$STEP_COUNT"
+        STEP_COUNT=$((STEP_COUNT + cnt))
+        local term_log="$wave_dir/${idx}.term"
+        local full_log="$wave_dir/${idx}.full"
+        local dur_file="$wave_dir/${idx}.dur"
+        local done_file="$wave_dir/${idx}.done"
+        (
+            STEP_COUNT="$start_step"
+            LOG_FILE="$full_log"
+            RECIPE_LOG_FILE="$full_log"
+            exec 3>>"$term_log"
+            exec > >(tee -a "$full_log" >> "$term_log"; : > "$done_file") 2>&1
+            local mt0 mt1
+            mt0=$(date +%s)
+            run_module_recipes "$mod" "$lbl"
+            mt1=$(date +%s)
+            echo "$((mt1 - mt0))" > "$dur_file"
+        ) &
+        pids+=($!)
+    done
+
+    local i
+    for i in $(seq 1 "$num_active"); do
+        _stream_job_output "$wave_dir/${i}.term" "$wave_dir/${i}.done" "${pids[$((i - 1))]}"
+        IFS='|' read -r mod lbl cnt <<< "${active_pairs[$((i - 1))]}"
+        [ -f "$wave_dir/${i}.full" ] && cat "$wave_dir/${i}.full" >> "$LOG_FILE"
+        local dur="0"
+        [ -f "$wave_dir/${i}.dur" ] && dur="$(cat "$wave_dir/${i}.dur" 2>/dev/null || echo 0)"
+        MODULE_KEYS+=("$mod")
+        MODULE_LABELS+=("$lbl")
+        MODULE_DURATIONS+=("$dur")
+    done
+
+    rm -rf "$wave_dir"
+}
+
+run_module_recipes() {
+    local mod="$1"
+    local label="$2"
+    should_run "$mod" || return 0
+
+    local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
+    [ -d "$mod_dir" ] || return 0
+
+    MODULE_KEYS+=("$mod")
+    MODULE_LABELS+=("$label")
+    local t0 t1; t0=$(date +%s)
+
+    local active_recipes=()
+    for recipe in "$mod_dir"/*.sh; do
+        [ -f "$recipe" ] || continue
+        if [ "${#SELECTED_RECIPES[@]}" -gt 0 ]; then
+            _is_recipe_selected "$recipe" || continue
+        elif [ "$mod" = "cleanup" ] && [[ "$recipe" == *"trim"* ]] && [ "${DO_TRIM:-false}" != "true" ]; then
+            continue
+        fi
+        active_recipes+=("$recipe")
+    done
+
+    case "$mod" in
+        core)
+            # Wave 1: Foundational runtime & package managers (sequential to preserve PATH & _NPM_GLOBAL_SYNCED)
+            local core_seq=() core_par=()
+            for r in "${active_recipes[@]}"; do
+                case "$(basename "$r")" in
+                    01-*|02-*|03-*|04-*|05-*) core_seq+=("$r") ;;
+                    *)                        core_par+=("$r") ;;
+                esac
+            done
+            for r in "${core_seq[@]}"; do _run_single_recipe "$r"; done
+            # Wave 2: All 17 independent toolchains, SDKs, IDEs, and RPM checks concurrently
+            _run_parallel_recipe_batch "${core_par[@]}"
+            ;;
+        ai|dev)
+            _run_parallel_recipe_batch "${active_recipes[@]}"
+            ;;
+        cleanup)
+            # Run all cache/container/journal cleanups concurrently, then run reboot/shell check last
+            local clean_par=() clean_last=()
+            for r in "${active_recipes[@]}"; do
+                case "$(basename "$r")" in
+                    06-reboot-check.sh) clean_last+=("$r") ;;
+                    *)                  clean_par+=("$r") ;;
+                esac
+            done
+            _run_parallel_recipe_batch "${clean_par[@]}"
+            for r in "${clean_last[@]}"; do _run_single_recipe "$r"; done
+            ;;
+        *)
+            for r in "${active_recipes[@]}"; do
+                _run_single_recipe "$r"
+            done
+            ;;
+    esac
+
+    t1=$(date +%s)
+    local elapsed=$((t1 - t0))
+    MODULE_DURATIONS+=("$elapsed")
+    echo -e "  ${CYAN}[${mod} time: $(format_duration "$elapsed")]${RESET}"
+}
+
+###############################################################################
+# MAIN
+###############################################################################
+main() {
+    [ "${#APP_QUERIES[@]}" -gt 0 ] && resolve_app_queries
+    [ "$APP_MENU" = "true" ] && select_apps_interactively
+
+    init_logging
+    local START_TIME; START_TIME=$(date +%s)
+
+    [ "$DRY_RUN" = "true" ] && echo -e "${BOLD}${YELLOW}============================================================\n   DRY-RUN MODE — No system changes will be made\n============================================================${RESET}\n"
+    if [ "${#SELECTED_RECIPES[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${MAGENTA}============================================================\n   TARGETED FORCE MODE — Updating ${#SELECTED_RECIPES[@]} selected application(s)\n============================================================${RESET}\n"
+    elif [ "${#FORCE_TARGETS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${MAGENTA}============================================================\n   SELECTIVE FORCE MODE — Force-restarting: ${FORCE_TARGETS[*]}\n============================================================${RESET}\n"
+    elif [ "$FORCE_UPDATE" = "true" ]; then
+        echo -e "${BOLD}${MAGENTA}============================================================\n   FORCE MODE — Running apps will be closed for updates & restarted\n============================================================${RESET}\n"
+    fi
+
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}          Starting Fedora Fleet Maintenance Suite           ${RESET}"
+    echo -e "${BOLD}${CYAN}  Log: $LOG_FILE${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}\n"
+
+    # Self-register symlinks on first run / after Syncthing sync to a new node
+    if [ "$SCRIPT_DIR" != "$HOME/.local/bin" ] && [ -f "$SCRIPT_DIR/update" ]; then
+        chmod +x "$SCRIPT_DIR/update" "$SCRIPT_DIR/update-all" "$SCRIPT_DIR/install.sh" 2>/dev/null || true
+        mkdir -p "$HOME/.local/bin"
+        if [ "$(readlink -f "$HOME/.local/bin/update" 2>/dev/null || true)" != "$SCRIPT_DIR/update" ]; then
+            ln -sfn "$SCRIPT_DIR/update" "$HOME/.local/bin/update" 2>/dev/null || true
+        fi
+        if [ -f "$SCRIPT_DIR/update-all" ] && [ "$(readlink -f "$HOME/.local/bin/update-all" 2>/dev/null || true)" != "$SCRIPT_DIR/update-all" ]; then
+            ln -sfn "$SCRIPT_DIR/update-all" "$HOME/.local/bin/update-all" 2>/dev/null || true
+        fi
+    fi
+
+    ensure_passwordless_sudo
+    compute_total_steps
+
+    run_module_recipes "core"     "Core Baseline"
+    run_parallel_modules \
+        "dnf|DNF Packages" \
+        "flatpak|Flatpaks" \
+        "snap|Snap Packages" \
+        "firmware|Firmware (LVFS)"
+    run_parallel_modules \
+        "ai|AI Runtimes" \
+        "dev|Dev Toolchains" \
+        "git|Git Documentation" \
+        "self|Self-Update"
+    run_module_recipes "cleanup"  "System Cleanup"
+
+    local END_TIME DURATION
+    END_TIME=$(date +%s); DURATION=$((END_TIME - START_TIME))
+
+    echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
+    echo -e "${BOLD}${CYAN}                     Execution Summary                      ${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}"
+    for i in "${!MODULE_KEYS[@]}"; do
+        local lbl="${MODULE_LABELS[$i]}"
+        local sec="${MODULE_DURATIONS[$i]}"
+        printf "  %-24s %s\n" "${lbl}:" "$(format_duration "$sec")"
+    done
+    echo -e "${CYAN}------------------------------------------------------------${RESET}"
+    printf "  ${BOLD}%-24s %s${RESET}\n" "Total Time:" "$(format_duration "$DURATION")"
+    echo -e "${CYAN}  Log File:                ${LOG_FILE}${RESET}"
+    echo -e "${BOLD}${CYAN}============================================================${RESET}\n"
+
+    command -v notify-send &>/dev/null && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && \
+        notify-send --icon=software-update-available --urgency=normal \
+            "Fedora Update Complete" "Done in $(format_duration "$DURATION"). Log: $LOG_FILE" 2>/dev/null || true
+}
+
+main "$@"
