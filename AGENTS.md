@@ -3,7 +3,8 @@
 > **Repository:** [fedora-update](file:///home/jay/projects/update/fedora-update)  
 > **Target OS:** Fedora Linux (Workstation, Development, VM, Personal)  
 > **Sync Layer:** [Syncthing](https://syncthing.net/) (Syncs `~/.gemini` and `~/projects/`)  
-> **Primary Executables:** [`update`](file:///home/jay/projects/update/fedora-update/update), [`update-all`](file:///home/jay/projects/update/fedora-update/update-all)
+> **Primary Executables:** [`update`](file:///home/jay/projects/update/fedora-update/update), [`update-all`](file:///home/jay/projects/update/fedora-update/update-all)  
+> **Automated Verification:** [`./test`](file:///home/jay/projects/update/fedora-update/test)
 
 ---
 
@@ -23,11 +24,12 @@ graph TD
         VM1["Fedora Minimal VM / Cloud Node<br/>(Clean Runtimes, Minimal)"]
     end
 
-    subgraph Fedora_Update_Suite["fedora-update Modular Architecture"]
+    subgraph Fedora_Update_Suite["fedora-update Recipe-Based Architecture"]
         Runner["CLI Runners:<br/><code>update</code> / <code>update-all</code>"]
-        Core["Core Baseline Module:<br/><code>modules/00_core_baseline.sh</code>"]
-        Engine["Modular Orchestrator:<br/><code>bin/fedora-update</code>"]
-        Safety["Safety Guards (Active Process & Git Dirty Tree)"]
+        Engine["Core Orchestrator:<br/>Argument parsing, logging, process mgmt, dynamic discovery"]
+        Recipes["Isolated Recipes (<code>recipes.d/*/*.sh</code>):<br/>Fault-isolated, zero blast radius"]
+        Helpers["Polyglot Helpers (<code>helpers/*.py</code>):<br/>Android Canary scraper, Electron asar extractor"]
+        Gate["Verification Gate (<code>./test</code>):<br/>Syntax & dry-run test harness"]
     end
 
     Dev1 <-->|Sync Dotfiles & Projects| Dev2
@@ -35,10 +37,9 @@ graph TD
     Pers1 <-->|Sync Dotfiles & Projects| VM1
 
     Runner --> Engine
-    Engine --> Safety
-    Engine --> Core
-    Core --> D1["Core Baseline: Node.js, npm, Pip, uv, Rust, Bun, Go, Docker, Android SDK/Studio, Micro, gh, Antigravity, Agy, Herdr"]
-    Engine --> D2["Dynamic Updates: DNF, Flatpak, LVFS, Claude, LM Studio, Ollama models, Git Repos, System Cleanup"]
+    Engine --> Recipes
+    Recipes --> Helpers
+    Gate -.-> Engine
 ```
 
 ---
@@ -47,102 +48,132 @@ graph TD
 
 ```
 fedora-update/
-├── update       # All logic lives here: ~970 lines, clearly sectioned
-├── update-all   # 4-line wrapper: exec update --trim
-├── install.sh   # First-time symlink + Syncthing bootstrap
-├── AGENTS.md    # Agent operating manual
-└── README.md    # User documentation & quickstart
+├── update                 # Core runner & lifecycle engine (~380 lines)
+├── update-all             # 4-line wrapper: exec update --trim "$@"
+├── install.sh             # Bootstrap symlinks, permissions & Syncthing
+├── test                   # Automated verification gate (bash -n, py_compile, dry-run)
+├── helpers/               # Standalone polyglot scripts
+│   ├── android_canary.py  # Android Studio Canary metadata resolver
+│   └── asar_icon.py       # Electron asar icon extractor
+├── recipes.d/             # Isolated tool recipes by category
+│   ├── core/              # Baseline fleet tools (22 recipes)
+│   ├── dnf/               # DNF upgrades & cleanups (3 recipes)
+│   ├── flatpak/           # Flatpak applications & runtimes (2 recipes)
+│   ├── snap/              # Snap packages & runtimes (1 recipe)
+│   ├── firmware/          # Hardware firmware checks (1 recipe)
+│   ├── ai/                # AI agents & LLM runtimes (5 recipes)
+│   ├── dev/               # Developer SDKs & extensions (5 recipes)
+│   ├── git/               # Parallel git documentation sync (1 recipe)
+│   ├── self/              # Self-update logic (1 recipe)
+│   └── cleanup/           # Docker, Podman, caches & journal vacuum (6 recipes)
+├── AGENTS.md              # Agent operating manual
+└── README.md              # User documentation & quickstart
 ```
 
-Everything is in one file. To add a new tool: open `update`, find the right `### SECTION` block, add a step. No sourcing, no module loading order, no extra files.
+### Why This Recipe Architecture is Optimized for AI Agents:
+1. **Zero Blast Radius:** Every tool has its own small file in `recipes.d/`. An LLM asked to modify or add a tool only loads and edits that single recipe (~30 lines, ~300 tokens).
+2. **Runtime Fault Tolerance:** `update` tests every recipe with `bash -n` before sourcing. If an LLM creates a syntax error in one recipe, it will log the error and safely proceed with all other system updates.
+3. **Dynamic Step Accounting:** `TOTAL_STEPS` is counted dynamically at launch by inspecting `recipes.d/`. No manual arithmetic bookkeeping is required when adding or removing tools.
+4. **Generic Lifecycle Engine (`sync_tar_app`):** Replaces ~400 lines of duplicated GUI/IDE shutdown, download, and restart logic across Android Studio, Antigravity Desktop, Antigravity IDE, and VS Code.
 
 ---
 
 ## 3. Fleet Tiering: Core Fleet Baseline vs Installed-Only Tools
 
-### 3.1 Core Fleet Baseline (`modules/00_core_baseline.sh`)
+### 3.1 Core Fleet Baseline (`recipes.d/core/`)
 *Guaranteed to be installed and kept updated on every Fedora node (Dev, Personal, or Minimal VM):*
 
-| Component | Install Method (if missing) | Upkeep & Active Guard |
+| Component | Recipe File | Install / Update Method |
 | :--- | :--- | :--- |
-| **Node.js Runtime** | `nvm install --lts` (or `sudo dnf install -y nodejs npm`) | Auto-track LTS via `nvm` or system package manager |
-| **Python 3 `pip`** | `sudo dnf install -y python3-pip` | `python3 -m pip install --user --upgrade pip` |
-| **Astral `uv`** | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `uv self update` |
-| **NPM Global Prefix** | Set prefix to `$HOME/.npm-global` | `npm update -g` |
-| **Python CLI Suite** | `uv tool install <pkg>` (or `pip install --user`) | `uv tool upgrade --all` |
-| **Micro Editor** | `sudo dnf install -y micro` | `micro -plugin update` |
-| **GitHub CLI (`gh`)** | `sudo dnf install -y gh` | `gh extension upgrade --all` (if authed) |
-| **Rust (`rustup`)** | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | `rustup update` |
-| **Bun Runtime** | `curl -fsSL https://bun.sh/install \| bash` | `bun upgrade` |
-| **Go & Tooling** | `sudo dnf install -y golang` $\rightarrow$ `gopls` & `dlv` | Module proxy query $\rightarrow$ `go install ...@latest` |
-| **Docker Engine & Compose** | Docker CE repo $\rightarrow$ `docker-ce`, `docker-compose-plugin`, enable systemd | DNF updates + `docker image prune -f` |
-| **Syncthing Sync Engine** | `sudo dnf install -y syncthing` $\rightarrow$ `0.0.0.0:8384` | User systemd service + DNF updates |
-| **Android CLI & SDK** | Google Commandline Tools $\rightarrow$ `~/Android/Sdk` | `android update` |
-| **Android Studio Preview** | Canary archive $\rightarrow$ `/opt/android-studio-preview` | Skip if running; update if idle |
-| **Antigravity Desktop** | Cloud Run Manifest $\rightarrow$ `~/.local/opt/antigravity` | Skip if running; update if idle |
-| **Antigravity IDE** | Cloud Run API $\rightarrow$ `~/.local/opt/antigravity-ide` | Skip if running; update if idle |
-| **Agy CLI (`agy`)** | Official installer / npm $\rightarrow$ `~/.local/bin/agy` | Skip if active; `agy update` if idle |
-| **Herdr CLI (`herdr`)** | `curl -fsSL https://herdr.dev/install.sh \| bash` | Skip if active; `herdr update` if idle |
+| **C/C++ Build Tools & Downloaders** | `01-c-build-tools.sh` | `gcc, gcc-c++, make, pkgconf-pkg-config, aria2, zstd` via DNF |
+| **Python 3 & pip** | `02-python-pip.sh` | `python3-pip` via DNF $\rightarrow$ `python3 -m pip install --upgrade pip` |
+| **Astral uv** | `03-astral-uv.sh` | Astral installer $\rightarrow$ `uv self update` |
+| **Node.js LTS** | `04-node-lts.sh` | `nvm install --lts` (or DNF fallback `nodejs npm`) |
+| **NPM Global Prefix** | `05-npm-global.sh` | Prefix set to `$HOME/.npm-global` $\rightarrow$ `npm update -g` |
+| **Python CLI Suite** | `06-python-cli-suite.sh` | `uv tool install --force` $\rightarrow$ `uv tool upgrade --all` |
+| **Micro Editor** | `07-micro-editor.sh` | DNF / binary $\rightarrow$ `micro -plugin update` |
+| **GitHub CLI (gh)** | `08-github-cli.sh` | DNF $\rightarrow$ `gh extension upgrade --all` |
+| **Rust (rustup)** | `09-rust-toolchain.sh` | `rustup update` + `cargo-tauri` version-check & build |
+| **Bun Runtime** | `10-bun-runtime.sh` | Bun installer $\rightarrow$ `bun upgrade` |
+| **Go & Tooling** | `11-golang-tooling.sh` | `golang` $\rightarrow$ `gopls`, `dlv`, & `goplay` via proxy check (`GOTOOLCHAIN=auto`) |
+| **Docker Engine & Compose** | `12-docker-engine.sh` | Docker CE repo $\rightarrow$ systemd service active |
+| **Android CLI & SDK** | `13-android-sdk.sh` | Google commandlinetools $\rightarrow$ `android update` |
+| **Android Studio Preview** | `14-android-studio-canary.sh` | Google Canary XML & CDN $\rightarrow$ `sync_tar_app` |
+| **Antigravity Desktop** | `15-antigravity-desktop.sh` | Cloud Run Manifest $\rightarrow$ `sync_tar_app` |
+| **Antigravity IDE** | `16-antigravity-ide.sh` | Cloud Run API $\rightarrow$ `sync_tar_app` |
+| **Agy CLI** | `17-agy-cli.sh` | `npm install -g @google/agy` $\rightarrow$ `agy update` |
+| **Herdr CLI** | `18-herdr-cli.sh` | Herdr installer $\rightarrow$ `herdr update --handoff` |
+| **Syncthing** | `19-syncthing.sh` | DNF + systemd user service + GUI on `0.0.0.0:8384` |
+| **AppImage Manager** | `20-app-manager.sh` | `app-manager --update-all` |
+| **RustDesk** | `21-rustdesk.sh` | GitHub Releases RPM (`rustdesk/rustdesk`) $\rightarrow$ `dnf install` |
+| **OpenLogi** | `22-openlogi.sh` | GitHub Releases RPM (`AprilNEA/OpenLogi`) $\rightarrow$ `dnf install` |
 
 ---
 
 ### 3.2 Dynamic Installed-Only Updates
 *Updated if present on the host; cleanly skipped without warnings if not:*
-- **OS Packages:** `dnf upgrade --refresh -y`, `dnf autoremove -y`, `dnf clean packages`.
-- **Flatpaks:** `flatpak update -y` (with `--no-static-deltas` fallback), `flatpak uninstall --unused -y`.
-- **Firmware:** `fwupdmgr refresh` and `fwupdmgr get-updates`.
-- **Secondary AI / LLMs:** Claude Code (`claude`), LM Studio (`lms`), Ollama binary + **only currently installed models**.
-- **Dev Toolchains:** SDKMAN! (`sdk update`), Google Cloud SDK (`gcloud components update`), VS Code extensions (`code --update-extensions --force`), Agent skills (`skills update`).
-- **Git Repositories:** `~/projects/docs/androidx`, `compose-samples`, `horologist`, `nowinandroid`, `~/.hermes/hermes-agent`.
-- **System Cleanup:** Docker dangling image prune, journalctl vacuum (14d/500MB), optional SSD TRIM (`update-all`), and reboot necessity checks (`dnf needs-restarting -r`).
+- **OS Packages (`recipes.d/dnf/`):** `01-upgrade.sh` (parallel DNF single pass), `02-autoremove.sh`, `03-clean.sh`.
+- **Flatpaks (`recipes.d/flatpak/`):** `01-prune-unused.sh` (pre-update cleanup), `02-update.sh` (with downgrade rollback masking).
+- **Snap Packages (`recipes.d/snap/`):** `01-snap-refresh.sh` (`snap refresh`).
+- **Firmware (`recipes.d/firmware/`):** `01-firmware.sh` (`fwupdmgr refresh` and `fwupdmgr get-updates`).
+- **AI Runtimes (`recipes.d/ai/`):** `01-claude-code.sh`, `02-lm-studio.sh`, `03-ollama-models.sh` (Ollama binary + concurrent model pulls), `04-nvbroadcast.sh` (NV Broadcast RPM from GitHub releases), `05-claude-desktop.sh` (Claude Desktop official Linux `.deb` repackaged to RPM via `claude-desktop-fedora/build-official.sh`).
+- **Dev Toolchains (`recipes.d/dev/`):** `01-sdkman.sh` (`sdk upgrade`), `02-gcloud-sdk.sh`, `03-vscode-extensions.sh`, `04-agent-skills.sh`, `05-distrobox.sh` (`distrobox-upgrade --all`).
+- **Git Repositories (`recipes.d/git/`):** `01-git-docs.sh` (parallel sync of `androidx`, `compose-samples`, `horologist`, `nowinandroid`, `unraid`, `audiobookshelf-api-docs`, `hermes-agent`, `claude-desktop-fedora`).
+- **Self-Update (`recipes.d/self/`):** `01-self-update.sh` (git pull with dirty tree check).
+- **System Cleanup (`recipes.d/cleanup/`):** `01-docker-prune.sh`, `02-caches.sh`, `03-journal-vacuum.sh`, `04-ssd-trim.sh`, `05-podman-prune.sh`, `06-reboot-check.sh`.
 
 ---
 
 ## 4. Key Agent Operating Rules & Safety Directives
 
-All AI agents interacting with this repository MUST adhere to these strict engineering principles:
-
 ### Rule 1: Active Agent & App Protection (Zero Interruption by Default; Safe Restart with `--force`)
-- Before modifying or updating an AI agent, IDE, or editor (Antigravity IDE/Desktop, Agy, Claude, Herdr, Android Studio, VS Code), verify whether its process is actively working via `is_app_running`.
-- **Default (Zero Interruption):** If the process is active, do not replace or restart the application binary. Skip the update for that run with an explicit notice to protect the user's active session.
-- **Force Mode (`--force` / `-f`):** When `--force` or `-f` is specified, `fedora-update` checks if an update is actually available first. If an update is required, it gracefully terminates the application (SIGTERM with clean shutdown wait and SIGKILL fallback), applies the update, and automatically relaunches the application (`gtk-launch` or background daemon).
-- **Ancestor Protection:** The update script verifies whether any running target process is an ancestor of the running shell (`$$`). If the script itself was spawned from inside an IDE or agent terminal, shutdown is automatically bypassed to prevent terminating the update run or user session.
+- Before modifying or updating an AI agent, IDE, or editor (Antigravity IDE/Desktop, Agy, Claude, Herdr, Android Studio, VS Code), verify whether its process is active via `is_*_running`.
+- **Default (Zero Interruption):** If the process is active, skip the update to protect the user's active session.
+- **Force Mode (`--force` / `-f`):** When `--force` is specified, `fedora-update` checks if an update is available first. If an update is required, it gracefully terminates the application (SIGTERM with clean shutdown wait and SIGKILL fallback), applies the update, and automatically relaunches the application (`gtk-launch` or background daemon).
+- **Targeted App Force-Update (`--app` / `-a [APP]` and `--force=APPS`):**
+  - `update --app` (or `update -a`) launches an interactive terminal selector (`fzf` multi-select with numbered fallback) showing live `[RUNNING]` / `[idle]` badges at the top of the list, then force-updates only the chosen recipe(s).
+  - `update --app <name>` (e.g. `update -a rustdesk`) immediately force-updates only the specified recipe(s) without touching other running apps.
+  - `update --force=<name>` runs the full suite while only force-restarting the specified app(s).
+- **Ancestor Protection:** The script verifies whether any running target process is an ancestor of the running shell (`$$`). If spawned inside an IDE terminal, shutdown is bypassed to prevent killing its own parent session.
 
 ### Rule 2: Syncthing Non-Interference & Git Worktree Guard
 - **Never modify Syncthing configuration, `.stignore`, or Syncthing service states.**
-- Before running `git pull --rebase` inside synced projects (e.g. `~/projects/docs/`), check `git status --porcelain`. If any uncommitted edits or untracked conflicts exist, cleanly bypass the pull to prevent Syncthing conflict storms across nodes.
+- Before running `git pull --rebase` inside synced projects, check `git status --porcelain`. If any uncommitted edits exist, cleanly bypass the pull.
 
-### Rule 3: Passwordless Sudo Resilience
-- Use `lib/common.sh::ensure_passwordless_sudo` to ensure non-interactive execution works seamlessly on all nodes without stalling on sudo passwords.
+### Rule 3: Verification Gate Mandatory Before Declaring Victory
+- **Always run `./test`** after modifying any code or recipe in this repository. Ensure all syntax checks and dry-run tests pass deterministically.
 
 ---
 
 ## 5. Agent Standard Operating Procedures (SOPs)
 
-### SOP 1: Auditing a Node Fleet Configuration
-1. Run `./update --help` to verify the modular engine.
-2. Run `./bin/fedora-update --only=core` to verify that all Core Baseline tools are present and functional.
-3. Review `~/.local/state/update/last-update.log` for deterministic execution results.
+### SOP 1: Adding a New Tool to the Suite
+1. Choose the appropriate category in `recipes.d/` (e.g. `core/`, `dev/`, `ai/`).
+2. Create a new `.sh` recipe file (e.g. `recipes.d/core/20-deno.sh`).
+3. Call `step "Core: Tool Name"` and write the check/install/update logic.
+4. Execute `./test` to verify syntax and dry-run simulation.
+5. `TOTAL_STEPS` and module filtering auto-detect the new file with zero manual bookkeeping.
 
-### SOP 2: Adding a New Tool to the Suite
-1. Determine if the tool is a **Core Baseline** item (required on all machines) or an **Installed-Only** item.
-2. If Core Baseline: add bootstrap logic and update logic in [`modules/00_core_baseline.sh`](file:///home/jay/projects/update/fedora-update/modules/00_core_baseline.sh).
-3. If Installed-Only: add existence check and update logic to the appropriate module in `modules/`.
-4. Validate with `bash -n` across all scripts.
+### SOP 2: Modifying an Existing Tool
+1. Locate the recipe: `recipes.d/<category>/<tool>.sh`.
+2. Inspect and modify only that file (~30 lines).
+3. Run `./test` to confirm bash syntax and dry-run execution.
 
-### SOP 3: Bootstrapping a Brand New Node
-When provisioning a fresh Fedora machine, VM, or container before Syncthing is running:
+### SOP 3: Provisioning a Fresh Node
+When provisioning a fresh Fedora machine before Syncthing is running:
 1. Clone the repository to `~/projects/update/fedora-update`.
-2. Run `~/projects/update/fedora-update/install.sh`.
-   * This symlinks executables to `~/.local/bin/`, installs **Syncthing**, configures the Web UI at `0.0.0.0:8384`, and enables `syncthing.service`.
-3. Execute `update` to trigger one-time passwordless sudo/Polkit setup and bootstrap all compilers, Docker, Android SDK, and AI agent toolchains.
+2. Run `bash install.sh`.
+   * Symlinks `update` and `update-all` into `~/.local/bin/`.
+   * Sets permissions on scripts, helpers, and recipes.
+   * Bootstraps **Syncthing** and configures the Web UI at `0.0.0.0:8384`.
+3. Execute `update` to trigger one-time passwordless sudo setup and bootstrap all toolchains.
 
 ---
 
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 3.1.4 (Safe App Shutdown & Restart with `--force`)
+- **Current Version:** 4.1.0 (Concurrent Wave Orchestrator, RPM Mutex & Claude Desktop Official RPM)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
@@ -150,71 +181,25 @@ When provisioning a fresh Fedora machine, VM, or container before Syncthing is r
 
 ## 7. Changelog
 
+### v4.1.0 (2026-10-22)
+
+**Architecture: Concurrent Wave Orchestrator & Claude Desktop Official RPM**
+- **Two-Tier Concurrency (`_run_parallel_recipe_batch` & `run_parallel_modules`):**
+  - **Intra-Module Concurrency:** Within `core` (after sequential bootstrap of `gcc`, `pip`, `uv`, `node`, `npm`), all 17 independent toolchains/apps run concurrently. All recipes within `ai`, `dev`, and `cleanup` (prior to `06-reboot-check.sh`), plus `gopls`/`dlv`/`goplay` and `ollama pull` workers, execute in parallel.
+  - **Inter-Module Wave Concurrency:** Overlaps `dnf` + `flatpak` + `snap` + `firmware` in Wave 1, and `ai` + `dev` + `git` + `self` in Wave 2, while preserving deterministic step numbering (`[1/46]`..`[46/46]`) and ordered terminal/log output.
+- **RPM Database Mutex (`with_rpm_lock`):** Serializes all `sudo dnf` and `sudo rpm` calls via `flock` so concurrent recipes can check APIs, download packages, and build RPMs in parallel without colliding on `/var/lib/rpm/.rpm.lock`.
+- **Claude Desktop Official Linux RPM (`recipes.d/ai/05-claude-desktop.sh`):** Verifies Anthropic's GPG-signed apt index via `~/projects/claude-desktop-fedora/build-official.sh`, respects running session protection (`--force` / `update --app claude-desktop`), and repackages/installs new releases automatically.
+
+### v4.0.0 (2026-09-29)
+
+**Architecture: LLM-Optimized Modular Recipe Architecture & AI Verification Gate**
+- **Contract-Based Recipes (`recipes.d/`):** Decomposed the 1,662-line monolithic script into 39 small, isolated recipe files categorized under `core/`, `dnf/`, `flatpak/`, `firmware/`, `ai/`, `dev/`, `git/`, `self/`, and `cleanup/`.
+- **Fault-Isolated Runner:** Orchestrator (`update`, ~380 lines) validates each recipe with `bash -n` at runtime before sourcing, ensuring that a syntax typo in one recipe cannot crash the fleet updater.
+- **Dynamic Step Accounting:** Replaced hardcoded step arithmetic (`TOTAL_STEPS=$((TOTAL_STEPS + 19))`) with dynamic recipe discovery matching `--only` and `--skip` flags.
+- **Generic Application Lifecycle Engine (`sync_tar_app`):** Unified download, extraction, version management, `--force` graceful shutdown (SIGTERM $\rightarrow$ SIGKILL), launcher generation, and background restart across Android Studio, Antigravity Desktop, Antigravity IDE, and VS Code.
+- **Polyglot Helper Extraction (`helpers/`):** Extracted 72 lines of embedded Python Canary XML/HTML scraping into `helpers/android_canary.py` and Electron asar unpacking into `helpers/asar_icon.py`.
+- **Dual-Channel Observability (`run_silent_log`):** Redirects stderr to `$LOG_FILE` while keeping interactive terminal output clean, eliminating silent error swallowing (`2>/dev/null || true`).
+- **AI Verification Gate (`./test`):** 1-second automated verification script checking `bash -n` across all entry points and recipes, `python3 -m py_compile` across helpers, and simulated `--dry-run` execution.
+
 ### v3.1.4 (2026-09-29)
-
-**New Features & Enhancements**
-- **Force Mode (`--force` / `-f`):** Added `--force` and `-f` flags to `update` and `update-all`. Running apps that would normally be skipped mid-session (Android Studio Preview, Antigravity Desktop, Antigravity IDE, VS Code, Agy CLI, Herdr CLI, Claude Code) are now safely shut down, updated, and automatically restarted once the update finishes.
-- **Graceful Shutdown & Fallback Escalation:** Implemented `safe_stop_app()` which sends SIGTERM to the root application processes to allow IDEs and Electron apps to flush state and exit cleanly, polls for exit up to 15s, and escalates to SIGKILL if processes hang.
-- **Automated Desktop & Background Relaunch:** Implemented `restart_app()` which re-executes applications via `gtk-launch` using standard desktop entries in graphical sessions (Wayland/X11) with headless/background `nohup` fallback.
-- **Ancestor Process Protection:** Guarded shutdown routines with `_is_ancestor_process()` to ensure that running `update --force` from an integrated IDE terminal or agent session does not inadvertently kill its own parent process tree.
-- **Version-Check-First Optimization:** Hoisted version/metadata checks before process shutdown across Android Studio Preview, Antigravity Desktop, Antigravity IDE, and Herdr so applications are never disrupted or restarted if they are already on the latest version.
-
-### v2.1.0 (2026-08-24)
-
-**Bug Fixes**
-- `--skip=` now supports comma-separated values and repeated flags (`--skip=dnf,flatpak` or `--skip=dnf --skip=flatpak`).
-- Fixed `local var="$(cmd)"` anti-pattern for `tmp_cmdline` in `00_core_baseline.sh` — declaration now separated from assignment to preserve mktemp exit code.
-- `STEP_COUNT` increment changed from `((++))` to safe arithmetic form (`$((N + 1))`) in both `step()` and `skip_step()` in `lib/common.sh`.
-- Ollama model updater now handles an empty model list without printing misleading `(0 detected)` output.
-- Deduplicated `arch=$(uname -m)` detection in `run_core_baseline()` — was called twice (steps 14 and 15); now hoisted to function top.
-- Normalized Antigravity Desktop ARM arch string from `linux-arm` → `linux-arm64` to match the IDE endpoint.
-
-**New Features**
-- `--dry-run` / `-n` flag: preview all steps without executing any system changes. `run_or_dry()` helper added to `lib/common.sh`; applied to DNF and Flatpak modules.
-- `modules/08_self_update.sh` extracted from `06_git_docs.sh`; available independently as `--only=self`.
-- `run_module()` helper in `bin/fedora-update` wraps every module with per-module elapsed time display.
-- `notify-send` desktop completion notification fires at the end of each run in graphical sessions.
-- High-visibility reboot-required banner (red box) replaces the previous low-contrast `[!]` warning in `07_cleanup.sh`.
-- `tauri-cli` version check added before slow `cargo install --locked` to avoid unnecessary recompilation when already current.
-- `install.sh` warns if `~/.local/bin` is not in `$PATH` after symlinking.
-
-### v3.0.0 (2026-08-25)
-
-**Architecture: Consolidated to Single-File**
-- Removed `bin/`, `lib/`, and `modules/` directories entirely (13 files deleted).
-- All logic consolidated into a single `update` script (~970 lines, clearly sectioned with `### SECTION:` headers).
-- `update-all` is now a 4-line wrapper (`exec update --trim "$@"`).
-- `install.sh` updated to only reference `update` and `update-all`.
-- Result: `grep -n "tool_name" update` finds anything instantly. Adding a new tool is adding a block, not touching multiple files.
-
-### v3.1.0 (2026-09-03)
-
-**Performance & Concurrency Optimizations**
-- **DNF Parallel Downloads & Single Pass:** Auto-configures `max_parallel_downloads=10` in `/etc/dnf/dnf.conf` across fleet nodes. Merged `makecache --refresh` into `dnf upgrade --refresh -y` in a single pass to eliminate redundant DNF process and repo loading overhead.
-- **Fixed Ollama False Upgrade Loop:** Corrected release tag regex extraction from GitHub's single-line minified JSON (`tag_name`), fixing a bug where `lv` evaluated to `2026`, causing the Ollama engine installer to re-download on every run.
-- **Parallel Git Documentation Sync:** Concurrent `git fetch` and dirty check across all documentation repositories (`androidx`, `compose-samples`, `horologist`, `nowinandroid`, `hermes-agent`) using isolated buffered subshells, reducing sync time from 20s+ to ~2s without log interleaving.
-- **Fast-Path Global NPM Updates:** Added `npm outdated -g --json` pre-check (~700ms) before `npm update -g` (6s+) to skip full package tree writes when all global packages are current.
-- **Claude Code Deduplication:** Skips redundant `claude update` network call if Claude is installed under `~/.npm-global` and was already verified in the NPM step.
-- **UV Tool Caching & Force Flag:** Cached `uv tool list` before the missing tools loop and added `--force` to `uv tool install` so legacy pip wrappers are replaced and successfully registered with `uv`. Removed duplicate `uv cache prune` from Core Baseline.
-- **Clean Needs-Restarting Output:** Passed `-q` to `sudo dnf needs-restarting` to eliminate repo loading chatter, and gracefully report when zero services require restarting.
-
-### v3.1.1 (2026-09-07)
-
-**Bug Fixes**
-- **Canonical Script Directory Resolution:** Resolved `${BASH_SOURCE[0]}` using `readlink -f` across `update`, `update-all`, and `install.sh`. Previously, invoking `update` via a symlink in `~/.local/bin` resulted in `SCRIPT_DIR` evaluating to `~/.local/bin`.
-- **Prevented Circular Symlink Creation:** Fixed self-registration logic in `update` line 1079 and `install.sh` that inadvertently overwrote `~/.local/bin/update` and `~/.local/bin/update-all` with circular symlinks pointing to themselves when invoked from PATH. Added guard against linking to `~/.local/bin` and adopted `ln -sfn`.
-
-### v3.1.2 (2026-09-17)
-
-**New Features & Enhancements**
-- **Automated Android Studio Canary Tracking:** Upgraded Android Studio Preview maintenance to automatically query Google's official Canary update channel (`AI-1-eap` in `updates.xml`) and preview download manifest. Validates live CDN archive availability with fallback resilience, automatically updating `/opt/android-studio-preview/` to the latest Canary release.
-- **Process Safety & Zero Interruption:** Enhanced `is_android_studio_running` with `studio` ELF binary detection to protect active IDE sessions from in-flight updates.
-- **Launcher & Wrapper Synchronization:** Dynamically generates and syncs desktop entries and CLI wrapper scripts (`~/.local/bin/android-studio-preview`) to `/opt/android-studio-preview/bin/studio.sh`.
-- **Antigravity Desktop & IDE Icon Synchronization:** Added automated extraction of `icon.png` from `resources/app.asar` when installing or maintaining Google Antigravity Desktop. Configured `StartupWMClass` across desktop entries and synced icons into `~/.local/share/icons/hicolor/512x512/apps/` to prevent missing taskbar/dash application icons across all fleet nodes.
-
-### v3.1.3 (2026-09-24)
-
-**New Features & Enhancements**
-- **Node.js LTS Auto-Tracking & Runtime Management:** Added explicit Step 4 (`Core: Node.js Runtime`) to Core Fleet Baseline. Detects and tracks latest LTS via Node Version Manager (`nvm`) with automatic alias resolution (`lts/*`), with automated DNF fallback (`nodejs npm`) for nodes without nvm.
-- **Subshell Environment Initialization:** Sources `$NVM_DIR/nvm.sh` in the script preamble and during Node/NPM checks so all dependent toolchain steps inherit the active Node/npm environment seamlessly.
-- **Core Baseline Step Accounting:** Updated Core Baseline step tally to 19 steps and renumbered subsequent step comments and logging counters.
+- Force Mode (`--force` / `-f`) and graceful application shutdown/restart.

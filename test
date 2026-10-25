@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# test — Automated syntax & dry-run verification gate for fedora-update
+# Designed for fast AI & developer verification (Jay Mode Directive 3: Prove It Works)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+cd "$SCRIPT_DIR"
+
+echo -e "\033[1;36m============================================================\033[0m"
+echo -e "\033[1;36m         fedora-update Automated Verification Gate          \033[0m"
+echo -e "\033[1;36m============================================================\033[0m\n"
+
+# 1. Shell syntax check on core scripts
+echo -e "\033[1m[*] Checking syntax of core entry points...\033[0m"
+bash -n update update-all install.sh
+echo -e "  \033[0;32m[OK] Core scripts passed bash -n\033[0m"
+
+# 2. Shell syntax check on all recipes
+echo -e "\033[1m[*] Checking syntax of all recipes in recipes.d/...\033[0m"
+recipe_count=0
+while IFS= read -r -d '' recipe; do
+    bash -n "$recipe"
+    recipe_count=$((recipe_count + 1))
+done < <(find "$SCRIPT_DIR/recipes.d" -name "*.sh" -print0)
+echo -e "  \033[0;32m[OK] All $recipe_count recipes passed bash -n\033[0m"
+
+# 3. Python syntax compilation on helpers
+echo -e "\033[1m[*] Checking Python helpers compilation in helpers/...\033[0m"
+python3 -m py_compile "$SCRIPT_DIR"/helpers/*.py
+echo -e "  \033[0;32m[OK] Python helpers compiled without errors\033[0m"
+
+# 4. Dry-run simulation of update orchestrator
+echo -e "\033[1m[*] Testing dry-run execution (--dry-run)...\033[0m"
+"$SCRIPT_DIR/update" --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] Full dry-run execution completed cleanly\033[0m"
+
+# 5. CLI flag filtering tests
+echo -e "\033[1m[*] Testing module filtering (--only=core --dry-run)...\033[0m"
+"$SCRIPT_DIR/update" --only=core --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] --only=core dry-run completed cleanly\033[0m"
+
+echo -e "\033[1m[*] Testing module exclusion (--skip=dnf,flatpak --dry-run)...\033[0m"
+"$SCRIPT_DIR/update" --skip=dnf,flatpak --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] --skip=dnf,flatpak dry-run completed cleanly\033[0m"
+
+echo -e "\033[1m[*] Testing targeted app force-update (--app rustdesk --dry-run)...\033[0m"
+"$SCRIPT_DIR/update" --app rustdesk --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] --app rustdesk dry-run completed cleanly\033[0m"
+
+echo -e "\033[1m[*] Testing Claude Desktop targeted force-update (--app claude-desktop --dry-run)...\033[0m"
+"$SCRIPT_DIR/update" --app claude-desktop --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] --app claude-desktop dry-run completed cleanly\033[0m"
+
+echo -e "\033[1m[*] Testing interactive menu selection (echo 1 | UPDATE_NO_FZF=1 update --app --dry-run)...\033[0m"
+echo "1" | UPDATE_NO_FZF=1 "$SCRIPT_DIR/update" --app --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] Interactive --app menu selection completed cleanly\033[0m"
+
+echo -e "\n\033[1;32m============================================================\033[0m"
+echo -e "\033[1;32m   ✓ ALL VERIFICATION CHECKS PASSED DETERMINISTICALLY      \033[0m"
+echo -e "\033[1;32m============================================================\033[0m\n"
