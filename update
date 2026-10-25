@@ -995,6 +995,29 @@ _run_single_recipe() {
     FORCE_UPDATE="$_prev_force"
 }
 
+# Stream a background job's buffered terminal output to fd 3 live, until the job and its tee finish
+_stream_job_output() {
+    local term="$1" done_file="$2" pid="$3"
+    local off=0 size finished=0 grace=0
+    while :; do
+        if [ -e "$done_file" ]; then
+            finished=1
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            # Job exited but its tee hasn't; a relaunched app may hold the pipe open, so don't wait forever
+            grace=$((grace + 1))
+            [ "$grace" -ge 8 ] && finished=1
+        fi
+        size="$(stat -c %s "$term" 2>/dev/null || echo 0)"
+        if [ "$size" -gt "$off" ]; then
+            tail -c +"$((off + 1))" "$term" | head -c "$((size - off))" >&3
+            off="$size"
+        fi
+        [ "$finished" -eq 1 ] && break
+        sleep 0.25
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
 _run_parallel_recipe_batch() {
     local recipes=("$@")
     local count="${#recipes[@]}"
@@ -1018,24 +1041,22 @@ _run_parallel_recipe_batch() {
         local assigned_step="$STEP_COUNT"
         local term_log="$batch_dir/${idx}.term"
         local full_log="$batch_dir/${idx}.full"
+        local done_file="$batch_dir/${idx}.done"
         (
             STEP_COUNT=$((assigned_step - 1))
             LOG_FILE="$full_log"
             RECIPE_LOG_FILE="$full_log"
-            exec > >(tee -a "$full_log" >> "$term_log") 2>&1
+            exec > >(tee -a "$full_log" >> "$term_log"; : > "$done_file") 2>&1
             _run_single_recipe "$r"
         ) &
         pids+=($!)
     done
 
-    # Stream each recipe's buffered output in deterministic step order as soon as it finishes
+    # Stream each recipe's output in deterministic step order: the head recipe streams live,
+    # later ones buffer until their turn
     local i
     for i in $(seq 1 "$count"); do
-        local pid="${pids[$((i - 1))]}"
-        wait "$pid" 2>/dev/null || true
-        if [ -f "$batch_dir/${i}.term" ]; then
-            cat "$batch_dir/${i}.term" >&3
-        fi
+        _stream_job_output "$batch_dir/${i}.term" "$batch_dir/${i}.done" "${pids[$((i - 1))]}"
         if [ -f "$batch_dir/${i}.full" ]; then
             cat "$batch_dir/${i}.full" >> "$LOG_FILE"
         fi
@@ -1097,12 +1118,13 @@ run_parallel_modules() {
         local term_log="$wave_dir/${idx}.term"
         local full_log="$wave_dir/${idx}.full"
         local dur_file="$wave_dir/${idx}.dur"
+        local done_file="$wave_dir/${idx}.done"
         (
             STEP_COUNT="$start_step"
             LOG_FILE="$full_log"
             RECIPE_LOG_FILE="$full_log"
             exec 3>>"$term_log"
-            exec > >(tee -a "$full_log" >> "$term_log") 2>&1
+            exec > >(tee -a "$full_log" >> "$term_log"; : > "$done_file") 2>&1
             local mt0 mt1
             mt0=$(date +%s)
             run_module_recipes "$mod" "$lbl"
@@ -1114,10 +1136,8 @@ run_parallel_modules() {
 
     local i
     for i in $(seq 1 "$num_active"); do
-        local pid="${pids[$((i - 1))]}"
-        wait "$pid" 2>/dev/null || true
+        _stream_job_output "$wave_dir/${i}.term" "$wave_dir/${i}.done" "${pids[$((i - 1))]}"
         IFS='|' read -r mod lbl cnt <<< "${active_pairs[$((i - 1))]}"
-        [ -f "$wave_dir/${i}.term" ] && cat "$wave_dir/${i}.term" >&3
         [ -f "$wave_dir/${i}.full" ] && cat "$wave_dir/${i}.full" >> "$LOG_FILE"
         local dur="0"
         [ -f "$wave_dir/${i}.dur" ] && dur="$(cat "$wave_dir/${i}.dur" 2>/dev/null || echo 0)"

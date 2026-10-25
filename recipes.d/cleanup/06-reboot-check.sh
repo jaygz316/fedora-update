@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-echo -e "\n${BOLD}${CYAN}============================================================${RESET}"
-echo -e "${BOLD}${CYAN}          Checking for Required Service Restarts            ${RESET}"
-echo -e "${BOLD}${CYAN}============================================================${RESET}"
+step "System: Checking for required reboots & service restarts"
 
 if command -v dnf &>/dev/null; then
     if with_rpm_lock sudo dnf needs-restarting -q -r >/dev/null 2>&1; then
