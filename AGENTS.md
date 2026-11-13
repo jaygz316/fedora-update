@@ -1,10 +1,10 @@
 # AGENTS.md — Fedora Multi-Node Update & Maintenance Suite (`fedora-update`)
 
-> **Repository:** [fedora-update](file:///home/jay/projects/update/fedora-update)  
+> **Repository:** [fedora-update](file:///home/jay/projects/update)  
 > **Target OS:** Fedora Linux (Workstation, Development, VM, Personal)  
 > **Sync Layer:** [Syncthing](https://syncthing.net/) (Syncs `~/.gemini` and `~/projects/`)  
-> **Primary Executables:** [`update`](file:///home/jay/projects/update/fedora-update/update), [`update-all`](file:///home/jay/projects/update/fedora-update/update-all)  
-> **Automated Verification:** [`./test`](file:///home/jay/projects/update/fedora-update/test)
+> **Primary Executables:** [`update`](file:///home/jay/projects/update/update), [`update-all`](file:///home/jay/projects/update/update-all)  
+> **Automated Verification:** [`./test`](file:///home/jay/projects/update/test)
 
 ---
 
@@ -54,7 +54,8 @@ fedora-update/
 ├── test                   # Automated verification gate (bash -n, py_compile, dry-run)
 ├── helpers/               # Standalone polyglot scripts
 │   ├── android_canary.py  # Android Studio Canary metadata resolver
-│   └── asar_icon.py       # Electron asar icon extractor
+│   ├── asar_icon.py       # Electron asar icon extractor
+│   └── sync_agent_configs.py # Canonical ~/.agents skill, rule, subagent & MCP syncer
 ├── recipes.d/             # Isolated tool recipes by category
 │   ├── core/              # Baseline fleet tools (22 recipes)
 │   ├── dnf/               # DNF upgrades & cleanups (3 recipes)
@@ -115,10 +116,10 @@ fedora-update/
 - **OS Packages (`recipes.d/dnf/`):** `01-upgrade.sh` (parallel DNF single pass), `02-autoremove.sh`, `03-clean.sh`.
 - **Flatpaks (`recipes.d/flatpak/`):** `01-prune-unused.sh` (pre-update cleanup), `02-update.sh` (with downgrade rollback masking).
 - **Snap Packages (`recipes.d/snap/`):** `01-snap-refresh.sh` (`snap refresh`).
-- **Firmware (`recipes.d/firmware/`):** `01-firmware.sh` (`fwupdmgr refresh` and `fwupdmgr get-updates`).
+- **Firmware (`recipes.d/firmware/`):** `01-firmware.sh` — check-only by default (`fwupdmgr get-updates`); with `--firmware` or `--restart` runs `sudo fwupdmgr update -y --no-reboot-check`. Staged capsule/BIOS updates are detected via `firmware_reboot_pending` (fwupd `UpdateState` 1/4) so `--restart` reboots to apply them.
 - **AI Runtimes (`recipes.d/ai/`):** `01-claude-code.sh`, `02-lm-studio.sh`, `03-ollama-models.sh` (Ollama binary + concurrent model pulls), `04-nvbroadcast.sh` (NV Broadcast RPM from GitHub releases), `05-claude-desktop.sh` (Claude Desktop official Linux `.deb` repackaged to RPM via `claude-desktop-fedora/build-official.sh`).
 - **Dev Toolchains (`recipes.d/dev/`):** `01-sdkman.sh` (`sdk upgrade`), `02-gcloud-sdk.sh`, `03-vscode-extensions.sh`, `04-agent-skills.sh`, `05-distrobox.sh` (`distrobox-upgrade --all`).
-- **Git Repositories (`recipes.d/git/`):** `01-git-docs.sh` (parallel sync of `androidx`, `compose-samples`, `horologist`, `nowinandroid`, `unraid`, `audiobookshelf-api-docs`, `hermes-agent`, `claude-desktop-fedora`).
+- **Git Repositories (`recipes.d/git/`):** `01-git-docs.sh` (parallel sync of `audiobookshelf-api-docs`, `hermes-agent`, `claude-desktop-fedora`).
 - **Self-Update (`recipes.d/self/`):** `01-self-update.sh` (git pull with dirty tree check).
 - **System Cleanup (`recipes.d/cleanup/`):** `01-docker-prune.sh`, `02-caches.sh`, `03-journal-vacuum.sh`, `04-ssd-trim.sh`, `05-podman-prune.sh`, `06-reboot-check.sh`.
 
@@ -135,6 +136,11 @@ fedora-update/
   - `update --app <name>` (e.g. `update -a rustdesk`) immediately force-updates only the specified recipe(s) without touching other running apps.
   - `update --force=<name>` runs the full suite while only force-restarting the specified app(s).
 - **Ancestor Protection:** The script verifies whether any running target process is an ancestor of the running shell (`$$`). If spawned inside an IDE terminal, shutdown is bypassed to prevent killing its own parent session.
+
+### Rule 1b: Auto-Restart (`--restart` / `-r`)
+- Opt-in only; also implies `--firmware`. After the execution summary, `maybe_auto_restart` re-runs `dnf needs-restarting -r`; exit code `1` (reboot required) or a staged fwupd firmware update (`firmware_reboot_pending`) triggers a reboot.
+- DNF failures (e.g. a repo with a rotated GPG signing key) are surfaced in red by `recipes.d/dnf/01-upgrade.sh`; one bad repo package aborts the whole transaction.
+- A 30-second countdown (override with `UPDATE_RESTART_DELAY`) lets the user cancel with any key. `--dry-run` only reports what would happen.
 
 ### Rule 2: Syncthing Non-Interference & Git Worktree Guard
 - **Never modify Syncthing configuration, `.stignore`, or Syncthing service states.**
@@ -161,7 +167,7 @@ fedora-update/
 
 ### SOP 3: Provisioning a Fresh Node
 When provisioning a fresh Fedora machine before Syncthing is running:
-1. Clone the repository to `~/projects/update/fedora-update`.
+1. Clone the repository to `~/projects/update`.
 2. Run `bash install.sh`.
    * Symlinks `update` and `update-all` into `~/.local/bin/`.
    * Sets permissions on scripts, helpers, and recipes.

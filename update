@@ -7,6 +7,8 @@
 # Usage: update [OPTIONS]
 #   --force, -f      Close running apps to apply updates, then restart them
 #   --trim           Also perform SSD TRIM (fstrim -av)
+#   --restart, -r    Reboot automatically after updates if a reboot is required (implies --firmware)
+#   --firmware       Install LVFS firmware updates (BIOS, UEFI dbx, etc.), not just check
 #   --only=MODULE    Run only one section: core|dnf|flatpak|snap|firmware|ai|dev|git|self|cleanup
 #   --skip=MODULES   Skip sections; comma-separated or repeated flag
 #   --dry-run, -n    Preview steps without making system changes
@@ -206,7 +208,7 @@ _is_process_excluded() {
     local comm; comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
     case "$comm" in pgrep|grep|bash|sh|zsh) return 0 ;; esac
     local cmdline; cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || true)
-    [[ "$cmdline" == *"telemetry_hook_bundle.js"* || "$cmdline" == *"fedora-update"* ]] && return 0
+    [[ "$cmdline" == *"telemetry_hook_bundle.js"* || "$cmdline" == *"fedora-update"* || "$cmdline" == *"/projects/update/update"* ]] && return 0
     return 1
 }
 
@@ -428,8 +430,12 @@ restart_app() {
         if [ -d "$_xdg" ]; then
             export XDG_RUNTIME_DIR="$_xdg"
             local _env
-            _env="$(systemctl --user show-environment 2>/dev/null | grep -E '^(DISPLAY|WAYLAND_DISPLAY|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP)=')"
-            [ -n "$_env" ] && eval "export $_env"
+            # XAUTHORITY is required for Xwayland/X11 clients (Electron defaults to X11)
+            _env="$(systemctl --user show-environment 2>/dev/null | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE)=')"
+            local _line
+            while IFS= read -r _line; do
+                [ -n "$_line" ] && export "$_line"
+            done <<< "$_env"
         fi
     fi
 
@@ -440,6 +446,9 @@ restart_app() {
             sleep 0.5
             waited=$((waited + 1))
         done
+        "$check_fn" || return 1
+        # Apps that fail display init exit within ~1s; confirm the process survives
+        sleep 3
         "$check_fn"
     }
 
@@ -628,9 +637,9 @@ _update_or_install_go_tool() {
 ###############################################################################
 # CLI FLAGS & ARGUMENT PARSING
 ###############################################################################
-DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; FORCE_UPDATE=false
+DO_TRIM=false; ONLY_MODULE=""; declare -a SKIP_MODULES=(); DRY_RUN=false; FORCE_UPDATE=false; AUTO_RESTART=false; FIRMWARE_UPDATE=false
 APP_MENU=false; declare -a APP_QUERIES=(); declare -a FORCE_TARGETS=(); declare -a SELECTED_RECIPES=()
-export DRY_RUN FORCE_UPDATE DO_TRIM
+export DRY_RUN FORCE_UPDATE DO_TRIM AUTO_RESTART FIRMWARE_UPDATE
 
 usage() {
     cat <<EOF
@@ -645,6 +654,10 @@ Options:
   --force=APPS       Run full suite, but only force-restart specified app(s)
                      e.g. update --force=rustdesk,vscode
   --trim             Also perform SSD TRIM (fstrim -av)
+  --restart, -r      Reboot automatically after updates if a reboot is required
+                     (30s countdown; press any key to cancel). Implies --firmware
+  --firmware         Install LVFS firmware updates (BIOS, UEFI dbx, ...) instead
+                     of only checking; staged firmware applies on next reboot
   --only=MODULE      Run only one section: core|dnf|flatpak|snap|firmware|ai|dev|git|self|cleanup
   --skip=MODULES     Skip sections; comma-separated or repeated
                      e.g. --skip=dnf,flatpak  or  --skip=dnf --skip=flatpak
@@ -703,6 +716,8 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --trim)       DO_TRIM=true; shift ;;
+        --restart|-r) AUTO_RESTART=true; FIRMWARE_UPDATE=true; shift ;;
+        --firmware)   FIRMWARE_UPDATE=true; shift ;;
         --only=*)     ONLY_MODULE="${1#*=}"; shift ;;
         --skip=*)     IFS=',' read -ra _sk <<< "${1#*=}"; SKIP_MODULES+=("${_sk[@]}"); shift ;;
         --dry-run|-n) DRY_RUN=true; shift ;;
@@ -1215,6 +1230,59 @@ run_module_recipes() {
 }
 
 ###############################################################################
+# AUTO-RESTART (--restart / -r)
+###############################################################################
+# Runs after the summary so every recipe has finished and the log is flushed.
+# Re-checks independently of cleanup/06-reboot-check.sh so --skip/--only still work.
+firmware_reboot_pending() {
+    command -v fwupdmgr &>/dev/null || return 1
+    timeout 20s fwupdmgr get-devices --json 2>/dev/null | grep -Eq '"UpdateState" *: *[14]([^0-9]|$)'
+}
+
+maybe_auto_restart() {
+    [ "$AUTO_RESTART" = "true" ] || return 0
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo -e "${YELLOW}[DRY-RUN] Would reboot now if 'dnf needs-restarting -r' or a staged fwupd firmware update requires it.${RESET}"
+        return 0
+    fi
+    if ! command -v dnf &>/dev/null; then
+        log_warn "--restart: dnf not found; cannot determine whether a reboot is required."
+        return 0
+    fi
+
+    local rc=0
+    with_rpm_lock sudo dnf needs-restarting -q -r >/dev/null 2>&1 || rc=$?
+    # Firmware staged by fwupd (UpdateState 1=pending, 4=needs-reboot) also needs a reboot
+    if [ "$rc" -ne 1 ] && firmware_reboot_pending; then
+        log_info "--restart: Firmware update staged by fwupd; reboot required to apply it."
+        rc=1
+    fi
+    # Exit 1 = reboot required; any other non-zero is an error, so don't reboot blindly
+    if [ "$rc" -eq 0 ]; then
+        log_ok "--restart: No reboot required."
+        return 0
+    elif [ "$rc" -ne 1 ]; then
+        log_warn "--restart: 'dnf needs-restarting -r' failed (exit $rc); not rebooting."
+        return 0
+    fi
+
+    local delay="${UPDATE_RESTART_DELAY:-30}"
+    echo -e "\n${BOLD}${RED}Reboot required — restarting in ${delay}s. Press any key to cancel.${RESET}"
+    if [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
+        if read -r -s -n 1 -t "$delay" </dev/tty; then
+            log_warn "--restart: Reboot cancelled by user. Run: systemctl reboot"
+            return 0
+        fi
+    else
+        sleep "$delay"
+    fi
+
+    echo "[$(date '+%F %T')] --restart: rebooting system" >> "$LOG_FILE" 2>/dev/null || true
+    systemctl reboot 2>/dev/null || sudo systemctl reboot
+}
+
+###############################################################################
 # MAIN
 ###############################################################################
 main() {
@@ -1285,6 +1353,8 @@ main() {
     command -v notify-send &>/dev/null && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && \
         notify-send --icon=software-update-available --urgency=normal \
             "Fedora Update Complete" "Done in $(format_duration "$DURATION"). Log: $LOG_FILE" 2>/dev/null || true
+
+    maybe_auto_restart
 }
 
 main "$@"

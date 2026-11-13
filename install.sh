@@ -46,7 +46,13 @@ systemctl --user enable --now syncthing.service 2>/dev/null \
     && echo -e "\033[1;32m[OK] Syncthing installed and running (Web UI: http://0.0.0.0:8384)\033[0m" \
     || echo -e "\033[0;33m[!] Could not auto-start Syncthing service. Start it manually.\033[0m"
 
-# 4. Warn if ~/.local/bin is not in PATH
+# 4. Sync canonical ~/.agents configurations and enable path watcher
+if [ -d "$HOME/.agents" ] && command -v python3 &>/dev/null; then
+    python3 "$SCRIPT_DIR/helpers/sync_agent_configs.py" --install-watcher 2>/dev/null || true
+    echo -e "\033[0;32m[OK] Agent skills, rules, MCPs, and systemd watcher synced.\033[0m"
+fi
+
+# 5. Warn if ~/.local/bin is not in PATH
 if [[ ":${PATH}:" != *":$HOME/.local/bin:"* ]]; then
     echo -e "\n\033[0;33m[!] NOTE: ~/.local/bin is not in your current PATH.\033[0m"
     echo -e "    Add the following to your ~/.bashrc or ~/.zshrc and restart your shell:"

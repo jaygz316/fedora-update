@@ -16,8 +16,8 @@ The project is synced across all machines via **Syncthing** (`~/projects/` and `
 
 ```bash
 # Clone to a new Fedora machine (before Syncthing is running)
-git clone https://github.com/jaygz316/fedora-update ~/projects/update/fedora-update
-bash ~/projects/update/fedora-update/install.sh
+git clone https://github.com/jaygz316/fedora-update ~/projects/update
+bash ~/projects/update/install.sh
 
 # Then just run:
 update
@@ -38,6 +38,8 @@ update --app rustdesk              # Immediately force-update only RustDesk (or 
 update --force, -f                 # Safely close all running apps for updates, then restart them
 update --force=rustdesk,vscode     # Full update run, but only force-restart specified app(s)
 update --dry-run, -n               # Preview all steps, no system changes
+update --restart, -r               # Reboot automatically at the end if a reboot is required (implies --firmware)
+update --firmware                  # Install LVFS firmware updates (BIOS, UEFI dbx) instead of only checking
 update --only=core                 # Run only one section
 update --skip=dnf,flatpak          # Skip sections (comma-separated)
 update --skip=dnf --skip=flatpak   # Skip sections (repeated flag)
@@ -51,7 +53,7 @@ update --trim                      # Include SSD TRIM step
 | `core`    | Baseline tools on every node (Node.js, npm, pip, uv, Rust, Bun, Go, Docker, Android SDK, Studio, Antigravity, Agy, Herdr, Syncthing, RustDesk, OpenLogi) | `recipes.d/core/` |
 | `dnf`     | DNF system upgrade, autoremove, cache clean | `recipes.d/dnf/` |
 | `flatpak` | Flatpak app + runtime updates, prune unused | `recipes.d/flatpak/` |
-| `firmware`| LVFS hardware firmware checks (fwupdmgr) | `recipes.d/firmware/` |
+| `firmware`| LVFS firmware checks; installs with `--firmware` / `-r` (fwupdmgr) | `recipes.d/firmware/` |
 | `ai`      | Claude Code, LM Studio, Ollama + installed models, NV Broadcast | `recipes.d/ai/` |
 | `dev`     | SDKMAN!, gcloud, VS Code extensions, Agent Skills | `recipes.d/dev/` |
 | `git`     | git pull on docs repos and Hermes agent framework | `recipes.d/git/` |

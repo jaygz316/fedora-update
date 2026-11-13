@@ -8,7 +8,11 @@ if command -v dnf &>/dev/null; then
         echo -e "\n${BOLD}${RED}╔══════════════════════════════════════════════════════════╗${RESET}"
         echo -e "${BOLD}${RED}║  ⚠  REBOOT REQUIRED — kernel or core libs updated        ║${RESET}"
         echo -e "${BOLD}${RED}╚══════════════════════════════════════════════════════════╝${RESET}"
-        echo -e "  Run: ${BOLD}systemctl reboot${RESET}"
+        if [ "${AUTO_RESTART:-false}" = "true" ]; then
+            echo -e "  ${BOLD}--restart set: system will reboot after the summary.${RESET}"
+        else
+            echo -e "  Run: ${BOLD}systemctl reboot${RESET}  (or re-run with ${BOLD}--restart${RESET})"
+        fi
     fi
     local restart_services; restart_services="$(with_rpm_lock sudo dnf needs-restarting -q -s 2>/dev/null || true)"
     if [ -n "$restart_services" ]; then

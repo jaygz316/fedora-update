@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 step "Self-Update: Checking fedora-update suite"
-local repo_path="${SCRIPT_DIR:-$HOME/projects/update/fedora-update}"
-[ ! -d "$repo_path/.git" ] && repo_path="$HOME/projects/update/fedora-update"
+local repo_path="${SCRIPT_DIR:-$HOME/projects/update}"
+[ ! -d "$repo_path/.git" ] && repo_path="$HOME/projects/update"
 if [ ! -d "$repo_path" ]; then
     log_warn "Repo not found at $repo_path; skipping."
     return 0

@@ -56,6 +56,10 @@ echo -e "\033[1m[*] Testing interactive menu selection (echo 1 | UPDATE_NO_FZF=1
 echo "1" | UPDATE_NO_FZF=1 "$SCRIPT_DIR/update" --app --dry-run > /dev/null
 echo -e "  \033[0;32m[OK] Interactive --app menu selection completed cleanly\033[0m"
 
+echo -e "\033[1m[*] Testing auto-restart flag (--restart --only=self --dry-run)...\033[0m"
+"$SCRIPT_DIR/update" --restart --only=self --dry-run > /dev/null
+echo -e "  \033[0;32m[OK] --restart dry-run completed cleanly\033[0m"
+
 echo -e "\n\033[1;32m============================================================\033[0m"
 echo -e "\033[1;32m   ✓ ALL VERIFICATION CHECKS PASSED DETERMINISTICALLY      \033[0m"
 echo -e "\033[1;32m============================================================\033[0m\n"

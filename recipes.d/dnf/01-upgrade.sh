@@ -32,6 +32,10 @@ else
                 echo -e "  ${GREEN}$line${RESET}" ;;
             *"Complete!"*)
                 echo -e "  ${GREEN}$line${RESET}" ;;
+            # Surface failures (e.g. rotated repo GPG keys) instead of hiding them
+            *"Transaction failed"*|*"check for package"*|*"Error"*|*"Problem"*|*"wrong key"*|*"conflicts with"*)
+                echo -e "  ${RED}$line${RESET}"
+                echo "$line" >> "${LOG_FILE:-/dev/null}" ;;
             *) ;;
         esac
     done
