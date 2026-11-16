@@ -33,21 +33,14 @@ if [ -n "$current_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
     return 0
 fi
 
-local was_running=false
-if is_openlogi_running; then
-    if [ "${FORCE_UPDATE:-false}" != "true" ]; then
-        echo -e "  ${YELLOW}[SKIP] OpenLogi desktop window is open; update ($current_ver -> $latest_ver) is available (use --force to update).${RESET}"
-        return 0
-    elif ! safe_stop_app "OpenLogi" get_openlogi_pids is_openlogi_running; then
-        return 1
-    else
-        was_running=true
-    fi
+# Not forced: leave an open window alone (checked before downloading anything)
+if is_openlogi_running && [ "${FORCE_UPDATE:-false}" != "true" ]; then
+    echo -e "  ${YELLOW}[SKIP] OpenLogi desktop window is open; update ($current_ver -> $latest_ver) is available (use --force to update).${RESET}"
+    return 0
 fi
 
 if [ "${DRY_RUN:-false}" = "true" ]; then
-    log_info "[DRY-RUN] Would update OpenLogi (${current_ver:-none} -> $latest_ver)..."
-    [ "$was_running" = "true" ] && restart_app "OpenLogi" "openlogi" "openlogi-desktop" is_openlogi_running
+    log_info "[DRY-RUN] Would download OpenLogi ${latest_ver}, then stop/install/restart it (${current_ver:-none} -> $latest_ver)..."
     return 0
 fi
 
@@ -73,36 +66,26 @@ if [ -z "$rpm_url" ]; then
 fi
 
 log_info "Updating OpenLogi (${current_ver:-none} -> $latest_ver)..."
-log_action "Downloading OpenLogi RPM..."
+log_action "Downloading OpenLogi RPM (OpenLogi keeps running)..."
 local tmp_dir; tmp_dir="$(mktemp -d -t "openlogi-update-XXXXXX")"
 local rpm_file="$tmp_dir/openlogi-${latest_ver}-linux-${pkg_arch}.rpm"
 
-if ! curl -# -fSL -o "$rpm_file" "$rpm_url" 2>/dev/null; then
+if ! fast_download "$rpm_url" "$rpm_file"; then
     log_warn "Failed to download OpenLogi RPM from $rpm_url; continuing..."
     rm -rf "$tmp_dir"
-    [ "$was_running" = "true" ] && restart_app "OpenLogi" "openlogi" "openlogi-desktop" is_openlogi_running
     return 1
 fi
 
-log_action "Installing verified OpenLogi RPM package..."
-if with_rpm_lock sudo dnf install --assumeyes "$rpm_file" >> "$LOG_FILE" 2>&1; then
-    log_ok "OpenLogi updated to $latest_ver."
-else
-    log_warn "DNF install encountered issues; attempting fallback rpm upgrade..."
-    with_rpm_lock sudo rpm -Uvh --replacepkgs "$rpm_file" >> "$LOG_FILE" 2>&1 \
-        && log_ok "OpenLogi updated to $latest_ver." \
-        || log_warn "RPM upgrade had issues, continuing..."
-fi
-rm -rf "$tmp_dir"
-
-if command -v systemctl &>/dev/null; then
+_restart_openlogi_agent() {
+    command -v systemctl &>/dev/null || return 0
     systemctl --user daemon-reload 2>/dev/null || true
     if systemctl --user is-active --quiet openlogi-agent.service 2>/dev/null; then
         log_action "Restarting openlogi-agent user service..."
         systemctl --user restart openlogi-agent.service 2>/dev/null || true
     fi
-fi
+}
 
-if [ "$was_running" = "true" ]; then
-    restart_app "OpenLogi" "openlogi" "openlogi-desktop" is_openlogi_running
-fi
+swap_rpm_app "OpenLogi" "$rpm_file" get_openlogi_pids is_openlogi_running \
+    "openlogi" "openlogi-desktop" _restart_openlogi_agent \
+    && log_ok "OpenLogi updated to $latest_ver."
+rm -rf "$tmp_dir"

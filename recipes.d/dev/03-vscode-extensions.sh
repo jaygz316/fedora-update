@@ -6,27 +6,23 @@ fi
 
 step "Dev: Visual Studio Code extensions"
 log_action "Checking Visual Studio Code extensions..."
-local was_running=false
 local proceed=true
+local running=false
 if is_vscode_running; then
+    running=true
     if [ "${FORCE_UPDATE:-false}" != "true" ]; then
-        echo -e "  ${YELLOW}[SKIP] VS Code is running; skipping extension updates (use --force to restart).${RESET}"
+        echo -e "  ${YELLOW}[SKIP] VS Code is running; skipping extension updates (use --force to update in place).${RESET}"
         proceed=false
-    elif ! safe_stop_app "Visual Studio Code" get_vscode_pids is_vscode_running; then
-        proceed=false
-    else
-        was_running=true
     fi
 fi
+# The CLI updates extensions on disk without closing VS Code; the open window just
+# asks to reload the affected extensions, so --force no longer needs to kill it.
 if [ "$proceed" = "true" ]; then
     if [ "${DRY_RUN:-false}" = "true" ]; then
-        log_info "[DRY-RUN] Would update Visual Studio Code extensions..."
-        [ "$was_running" = "true" ] && restart_app "Visual Studio Code" "code" "code" is_vscode_running
+        log_info "[DRY-RUN] Would update Visual Studio Code extensions (VS Code stays open)..."
     else
         run_silent_log code --update-extensions --force || log_warn "VS Code extension update had issues, continuing..."
         log_ok "VS Code extensions updated."
-        if [ "$was_running" = "true" ]; then
-            restart_app "Visual Studio Code" "code" "code" is_vscode_running
-        fi
+        [ "$running" = "true" ] && log_info "VS Code stayed open; reload the window if it prompts for updated extensions."
     fi
 fi

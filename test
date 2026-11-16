@@ -14,7 +14,8 @@ echo -e "\033[1;36m============================================================\
 # 1. Shell syntax check on core scripts
 echo -e "\033[1m[*] Checking syntax of core entry points...\033[0m"
 bash -n update update-all install.sh
-echo -e "  \033[0;32m[OK] Core scripts passed bash -n\033[0m"
+for lib in "$SCRIPT_DIR"/lib/*.sh; do bash -n "$lib"; done
+echo -e "  \033[0;32m[OK] Core scripts & lib/ passed bash -n\033[0m"
 
 # 2. Shell syntax check on all recipes
 echo -e "\033[1m[*] Checking syntax of all recipes in recipes.d/...\033[0m"
@@ -59,6 +60,19 @@ echo -e "  \033[0;32m[OK] Interactive --app menu selection completed cleanly\033
 echo -e "\033[1m[*] Testing auto-restart flag (--restart --only=self --dry-run)...\033[0m"
 "$SCRIPT_DIR/update" --restart --only=self --dry-run > /dev/null
 echo -e "  \033[0;32m[OK] --restart dry-run completed cleanly\033[0m"
+
+echo -e "\033[1m[*] Testing that --restart implies --force (-r --only=self --dry-run)...\033[0m"
+restart_out="$("$SCRIPT_DIR/update" -r --only=self --dry-run 2>&1)"
+grep -q "FORCE MODE" <<< "$restart_out"
+echo -e "  \033[0;32m[OK] -r enables force mode\033[0m"
+
+echo -e "\033[1m[*] Testing step accounting across the concurrent wave (full --dry-run)...\033[0m"
+steps_out="$("$SCRIPT_DIR/update" --dry-run 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '^\[[+-]\] \[[0-9]+/[0-9]+\]' | grep -oE '[0-9]+/[0-9]+')"
+total="$(head -n1 <<< "$steps_out" | cut -d/ -f2)"
+expected="$(seq 1 "$total" | tr '\n' ' ')"
+actual="$(cut -d/ -f1 <<< "$steps_out" | tr '\n' ' ')"
+[ "$actual" = "$expected" ] || { echo "Step numbering mismatch: got [$actual] expected [$expected]"; exit 1; }
+echo -e "  \033[0;32m[OK] Steps numbered 1..$total in order\033[0m"
 
 echo -e "\n\033[1;32m============================================================\033[0m"
 echo -e "\033[1;32m   ✓ ALL VERIFICATION CHECKS PASSED DETERMINISTICALLY      \033[0m"

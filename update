@@ -7,14 +7,14 @@
 # Usage: update [OPTIONS]
 #   --force, -f      Close running apps to apply updates, then restart them
 #   --trim           Also perform SSD TRIM (fstrim -av)
-#   --restart, -r    Reboot automatically after updates if a reboot is required (implies --firmware)
+#   --restart, -r    Reboot automatically after updates if a reboot is required (implies --force --firmware)
 #   --firmware       Install LVFS firmware updates (BIOS, UEFI dbx, etc.), not just check
 #   --only=MODULE    Run only one section: core|dnf|flatpak|snap|firmware|ai|dev|git|self|cleanup
 #   --skip=MODULES   Skip sections; comma-separated or repeated flag
 #   --dry-run, -n    Preview steps without making system changes
 #   -h, --help       Show this help
 #
-# Run order: core -> dnf -> flatpak -> snap -> firmware -> ai -> dev -> git -> self -> cleanup
+# Run order: core bootstrap -> [core | dnf | flatpak | snap | firmware | ai | dev | git | self] concurrently -> cleanup
 
 set -u
 
@@ -124,13 +124,37 @@ run_silent_log() {
     fi
 }
 
+RPM_LOCK_FILE="/tmp/fedora-update-rpm-${UID:-$(id -u)}.lock"
+RPM_LOCK_TIMEOUT="${UPDATE_RPM_LOCK_TIMEOUT:-1800}"
+_RPM_LOCK_FD=""
+
 with_rpm_lock() {
-    local lock_file="/tmp/fedora-update-rpm-${UID:-$(id -u)}.lock"
-    if command -v flock &>/dev/null; then
-        flock -w 600 "$lock_file" "$@"
-    else
+    # Already held by this (sub)shell via rpm_lock_acquire: flocking again would self-deadlock
+    if [ -n "$_RPM_LOCK_FD" ] || ! command -v flock &>/dev/null; then
         "$@"
+    else
+        flock -w "$RPM_LOCK_TIMEOUT" "$RPM_LOCK_FILE" "$@"
     fi
+}
+
+# Hold the RPM lock across several commands (stop app -> install -> release), so a running
+# app is only closed once the RPM database is free (e.g. after a concurrent dnf upgrade).
+# Release BEFORE relaunching anything: a child inherits the fd and would hold the lock.
+rpm_lock_acquire() {
+    [ -n "$_RPM_LOCK_FD" ] && return 0
+    command -v flock &>/dev/null || return 0
+    exec {_RPM_LOCK_FD}>>"$RPM_LOCK_FILE" || { _RPM_LOCK_FD=""; return 1; }
+    if ! flock -w "$RPM_LOCK_TIMEOUT" "$_RPM_LOCK_FD"; then
+        exec {_RPM_LOCK_FD}>&-; _RPM_LOCK_FD=""
+        return 1
+    fi
+}
+
+rpm_lock_release() {
+    [ -z "$_RPM_LOCK_FD" ] && return 0
+    flock -u "$_RPM_LOCK_FD" 2>/dev/null || true
+    exec {_RPM_LOCK_FD}>&-
+    _RPM_LOCK_FD=""
 }
 
 ###############################################################################
@@ -514,63 +538,87 @@ sync_tar_app() {
     local launcher_fn="${10:-}"
     local priv_mode="${11:-user}"
 
-    local was_running=false
-    local proceed=true
-    if "$check_fn"; then
-        if [ "${FORCE_UPDATE:-false}" != "true" ]; then
-            echo -e "  ${YELLOW}[SKIP] $app_name is running; skipping update (use --force to restart).${RESET}"
-            [ -n "$launcher_fn" ] && "$launcher_fn"
-            return 0
-        elif ! safe_stop_app "$app_name" "$pids_fn" "$check_fn"; then
-            [ -n "$launcher_fn" ] && "$launcher_fn"
-            return 1
-        else
-            was_running=true
-        fi
+    local sudo_cmd=""; [ "$priv_mode" = "sudo" ] && sudo_cmd="sudo"
+
+    if "$check_fn" && [ "${FORCE_UPDATE:-false}" != "true" ]; then
+        echo -e "  ${YELLOW}[SKIP] $app_name is running; skipping update (use --force to restart).${RESET}"
+        [ -n "$launcher_fn" ] && "$launcher_fn"
+        return 0
     fi
 
     if [ "${DRY_RUN:-false}" = "true" ]; then
-        log_info "[DRY-RUN] Would update $app_name (${current_ver:-none} -> $latest_ver)..."
+        log_info "[DRY-RUN] Would download & stage $app_name (${current_ver:-none} -> $latest_ver) while it keeps running..."
+        "$check_fn" && log_info "[DRY-RUN] Would then shut down $app_name, swap in the new build, and restart it."
         [ -n "$launcher_fn" ] && "$launcher_fn"
-        [ "$was_running" = "true" ] && restart_app "$app_name" "$desktop_id" "$fallback_cmd" "$check_fn"
         return 0
     fi
+
+    # Download + extract while the app keeps running; it is only closed for the final swap.
+    # Staging sits next to the target (same filesystem) so the swap is an instant rename.
+    local parent_dir; parent_dir="$(dirname "$target_dir")"
+    local stage_dir="$parent_dir/.$(basename "$target_dir").staging"
+    local old_dir="$parent_dir/.$(basename "$target_dir").old"
 
     log_info "Updating $app_name (${current_ver:-none} -> $latest_ver)..."
     log_action "Downloading $app_name archive ($latest_ver)..."
     local tmp_w; tmp_w="$(mktemp -d -t "app-update-XXXXXX")"
     local archive_file="$tmp_w/app.tar.gz"
-
-    if fast_download "$download_url" "$archive_file"; then
-        log_action "Extracting and installing to $target_dir..."
-        mkdir -p "$tmp_w/x"
-        if tar -xzf "$archive_file" -C "$tmp_w/x"; then
-            local pd; pd="$(find "$tmp_w/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-            [ -z "$pd" ] && pd="$tmp_w/x"
-            if [ "$priv_mode" = "sudo" ]; then
-                sudo mkdir -p "$target_dir"
-                sudo find "$target_dir" -mindepth 1 -delete 2>/dev/null || true
-                sudo mv "$pd"/* "$target_dir/"
-                sudo chown -R "$(id -u):$(id -g)" "$target_dir" 2>/dev/null || true
-            else
-                rm -rf "$target_dir"
-                mkdir -p "$target_dir"
-                mv "$pd"/* "$target_dir/"
-            fi
-            echo "$latest_ver" > "$target_dir/.version" 2>/dev/null || sudo bash -c "echo '$latest_ver' > '$target_dir/.version'"
-            [ -n "$launcher_fn" ] && "$launcher_fn"
-            log_ok "$app_name updated to $latest_ver."
-            if [ "$was_running" = "true" ]; then
-                restart_app "$app_name" "$desktop_id" "$fallback_cmd" "$check_fn"
-            fi
-        else
-            log_warn "Failed to extract $app_name archive."
-        fi
-    else
+    if ! fast_download "$download_url" "$archive_file"; then
         log_warn "Failed to download $app_name archive from $download_url"
+        rm -rf "$tmp_w"
+        [ -n "$launcher_fn" ] && "$launcher_fn"
+        return 1
+    fi
+
+    log_action "Staging $app_name $latest_ver..."
+    $sudo_cmd mkdir -p "$parent_dir"
+    $sudo_cmd rm -rf "$stage_dir" "$old_dir" 2>/dev/null || true
+    $sudo_cmd mkdir -p "$stage_dir" && $sudo_cmd chown "$(id -u):$(id -g)" "$stage_dir"
+    if ! tar -xzf "$archive_file" -C "$stage_dir"; then
+        log_warn "Failed to extract $app_name archive."
+        rm -rf "$tmp_w"; $sudo_cmd rm -rf "$stage_dir"
+        [ -n "$launcher_fn" ] && "$launcher_fn"
+        return 1
     fi
     rm -rf "$tmp_w"
+    # Archive is either one top-level directory or a flat layout
+    local new_build="$stage_dir"
+    local entries=("$stage_dir"/*)
+    [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ] && new_build="${entries[0]}"
+
+    local was_running=false
+    if "$check_fn"; then
+        if [ "${FORCE_UPDATE:-false}" != "true" ]; then
+            echo -e "  ${YELLOW}[SKIP] $app_name was launched during download; leaving it running.${RESET}"
+            $sudo_cmd rm -rf "$stage_dir"
+            [ -n "$launcher_fn" ] && "$launcher_fn"
+            return 0
+        elif ! safe_stop_app "$app_name" "$pids_fn" "$check_fn"; then
+            $sudo_cmd rm -rf "$stage_dir"
+            [ -n "$launcher_fn" ] && "$launcher_fn"
+            return 1
+        fi
+        was_running=true
+    fi
+
+    log_action "Swapping in $app_name $latest_ver..."
+    [ -e "$target_dir" ] && $sudo_cmd mv "$target_dir" "$old_dir"
+    if $sudo_cmd mv "$new_build" "$target_dir"; then
+        echo "$latest_ver" > "$target_dir/.version" 2>/dev/null || sudo bash -c "echo '$latest_ver' > '$target_dir/.version'"
+        [ -n "$launcher_fn" ] && "$launcher_fn"
+        log_ok "$app_name updated to $latest_ver."
+    else
+        log_warn "Failed to install $app_name; restoring previous version."
+        [ -e "$old_dir" ] && $sudo_cmd mv "$old_dir" "$target_dir"
+    fi
+    [ "$was_running" = "true" ] && restart_app "$app_name" "$desktop_id" "$fallback_cmd" "$check_fn"
+    # Delete the old build after the relaunch so it stays off the downtime path
+    $sudo_cmd rm -rf "$stage_dir" "$old_dir" 2>/dev/null || true
 }
+
+for _lib in "$SCRIPT_DIR"/lib/*.sh; do
+    [ -f "$_lib" ] && bash -n "$_lib" 2>/dev/null && source "$_lib"
+done
 
 ###############################################################################
 # GIT GUARD — Syncthing-safe git pull (skips on dirty working tree)
@@ -655,7 +703,8 @@ Options:
                      e.g. update --force=rustdesk,vscode
   --trim             Also perform SSD TRIM (fstrim -av)
   --restart, -r      Reboot automatically after updates if a reboot is required
-                     (30s countdown; press any key to cancel). Implies --firmware
+                     (30s countdown; press any key to cancel). Implies --force
+                     and --firmware
   --firmware         Install LVFS firmware updates (BIOS, UEFI dbx, ...) instead
                      of only checking; staged firmware applies on next reboot
   --only=MODULE      Run only one section: core|dnf|flatpak|snap|firmware|ai|dev|git|self|cleanup
@@ -716,7 +765,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --trim)       DO_TRIM=true; shift ;;
-        --restart|-r) AUTO_RESTART=true; FIRMWARE_UPDATE=true; shift ;;
+        --restart|-r) AUTO_RESTART=true; FIRMWARE_UPDATE=true; FORCE_UPDATE=true; shift ;;
         --firmware)   FIRMWARE_UPDATE=true; shift ;;
         --only=*)     ONLY_MODULE="${1#*=}"; shift ;;
         --skip=*)     IFS=',' read -ra _sk <<< "${1#*=}"; SKIP_MODULES+=("${_sk[@]}"); shift ;;
@@ -1007,6 +1056,7 @@ _run_single_recipe() {
         fi
     fi
     source "$recipe"
+    rpm_lock_release   # safety net if a recipe returned early while holding the lock
     FORCE_UPDATE="$_prev_force"
 }
 
@@ -1080,12 +1130,19 @@ _run_parallel_recipe_batch() {
     rm -rf "$batch_dir"
 }
 
-_count_module_active_recipes() {
+# Core recipes 01-05 (gcc, pip, uv, node, npm) are the foundation everything else builds on
+_is_core_bootstrap_recipe() {
+    case "$(basename "$1")" in 01-*|02-*|03-*|04-*|05-*) return 0 ;; esac
+    return 1
+}
+_CORE_BOOTSTRAPPED=false
+
+# Print the recipes a module will run, honoring --app/--only/--skip/--trim and the bootstrap split
+_module_active_recipes() {
     local mod="$1"
-    local count=0
-    should_run "$mod" || { echo 0; return 0; }
+    should_run "$mod" || return 0
     local mod_dir="$SCRIPT_DIR/recipes.d/$mod"
-    [ -d "$mod_dir" ] || { echo 0; return 0; }
+    [ -d "$mod_dir" ] || return 0
     local r
     for r in "$mod_dir"/*.sh; do
         [ -f "$r" ] || continue
@@ -1094,9 +1151,30 @@ _count_module_active_recipes() {
         elif [ "$mod" = "cleanup" ] && [[ "$r" == *"trim"* ]] && [ "${DO_TRIM:-false}" != "true" ]; then
             continue
         fi
-        count=$((count + 1))
+        [ "$mod" = "core" ] && [ "$_CORE_BOOTSTRAPPED" = "true" ] && _is_core_bootstrap_recipe "$r" && continue
+        echo "$r"
     done
-    echo "$count"
+}
+
+_count_module_active_recipes() {
+    local list; list="$(_module_active_recipes "$1")"
+    [ -z "$list" ] && { echo 0; return 0; }
+    wc -l <<< "$list"
+}
+
+# Run core 01-05 sequentially in the main shell so PATH/_NPM_GLOBAL_SYNCED reach every later wave
+run_core_bootstrap() {
+    local boot=() r
+    while IFS= read -r r; do
+        [ -n "$r" ] && _is_core_bootstrap_recipe "$r" && boot+=("$r")
+    done < <(_module_active_recipes core)
+    _CORE_BOOTSTRAPPED=true
+    [ "${#boot[@]}" -eq 0 ] && return 0
+    local t0; t0=$(date +%s)
+    for r in "${boot[@]}"; do _run_single_recipe "$r"; done
+    local elapsed=$(( $(date +%s) - t0 ))
+    MODULE_KEYS+=("core-bootstrap"); MODULE_LABELS+=("Core Bootstrap"); MODULE_DURATIONS+=("$elapsed")
+    echo -e "  ${CYAN}[core bootstrap time: $(format_duration "$elapsed")]${RESET}"
 }
 
 run_parallel_modules() {
@@ -1176,29 +1254,20 @@ run_module_recipes() {
     MODULE_LABELS+=("$label")
     local t0 t1; t0=$(date +%s)
 
-    local active_recipes=()
-    for recipe in "$mod_dir"/*.sh; do
-        [ -f "$recipe" ] || continue
-        if [ "${#SELECTED_RECIPES[@]}" -gt 0 ]; then
-            _is_recipe_selected "$recipe" || continue
-        elif [ "$mod" = "cleanup" ] && [[ "$recipe" == *"trim"* ]] && [ "${DO_TRIM:-false}" != "true" ]; then
-            continue
-        fi
-        active_recipes+=("$recipe")
-    done
+    local active_recipes=() recipe
+    while IFS= read -r recipe; do
+        [ -n "$recipe" ] && active_recipes+=("$recipe")
+    done < <(_module_active_recipes "$mod")
 
     case "$mod" in
         core)
-            # Wave 1: Foundational runtime & package managers (sequential to preserve PATH & _NPM_GLOBAL_SYNCED)
+            # Bootstrap (01-05) runs sequentially unless run_core_bootstrap already did it
             local core_seq=() core_par=()
             for r in "${active_recipes[@]}"; do
-                case "$(basename "$r")" in
-                    01-*|02-*|03-*|04-*|05-*) core_seq+=("$r") ;;
-                    *)                        core_par+=("$r") ;;
-                esac
+                if _is_core_bootstrap_recipe "$r"; then core_seq+=("$r"); else core_par+=("$r"); fi
             done
             for r in "${core_seq[@]}"; do _run_single_recipe "$r"; done
-            # Wave 2: All 17 independent toolchains, SDKs, IDEs, and RPM checks concurrently
+            # All independent toolchains, SDKs, IDEs, and RPM checks concurrently
             _run_parallel_recipe_batch "${core_par[@]}"
             ;;
         ai|dev)
@@ -1252,7 +1321,12 @@ maybe_auto_restart() {
     fi
 
     local rc=0
-    with_rpm_lock sudo dnf needs-restarting -q -r >/dev/null 2>&1 || rc=$?
+    # Reuse cleanup/06-reboot-check.sh's result when it ran (saves a second slow dnf call)
+    if [ -n "${REBOOT_CHECK_RC:-}" ]; then
+        rc="$REBOOT_CHECK_RC"
+    else
+        with_rpm_lock sudo dnf needs-restarting -q -r >/dev/null 2>&1 || rc=$?
+    fi
     # Firmware staged by fwupd (UpdateState 1=pending, 4=needs-reboot) also needs a reboot
     if [ "$rc" -ne 1 ] && firmware_reboot_pending; then
         log_info "--restart: Firmware update staged by fwupd; reboot required to apply it."
@@ -1321,17 +1395,22 @@ main() {
     ensure_passwordless_sudo
     compute_total_steps
 
-    run_module_recipes "core"     "Core Baseline"
+    # 1) Foundational runtimes (gcc, pip, uv, node, npm) that later recipes call into
+    run_core_bootstrap
+    # 2) Everything independent runs at once, so no module waits on dnf. RPM installs are
+    #    serialized by the RPM lock; GUI apps download while still running and are only
+    #    closed for the final swap, so they come back while dnf/flatpak continue.
     run_parallel_modules \
+        "core|Core Baseline" \
         "dnf|DNF Packages" \
         "flatpak|Flatpaks" \
         "snap|Snap Packages" \
-        "firmware|Firmware (LVFS)"
-    run_parallel_modules \
+        "firmware|Firmware (LVFS)" \
         "ai|AI Runtimes" \
         "dev|Dev Toolchains" \
         "git|Git Documentation" \
         "self|Self-Update"
+    # 3) Cache/container pruning and the reboot check need everything else finished
     run_module_recipes "cleanup"  "System Cleanup"
 
     local END_TIME DURATION

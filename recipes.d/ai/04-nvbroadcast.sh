@@ -40,21 +40,14 @@ if [ -n "$current_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
     return 0
 fi
 
-local was_running=false
-if is_nvbroadcast_running; then
-    if [ "${FORCE_UPDATE:-false}" != "true" ]; then
-        echo -e "  ${YELLOW}[SKIP] NV Broadcast is running; update ($current_ver -> $latest_ver) is available (use --force to update).${RESET}"
-        return 0
-    elif ! safe_stop_app "NV Broadcast" get_nvbroadcast_pids is_nvbroadcast_running; then
-        return 1
-    else
-        was_running=true
-    fi
+# Not forced: leave a running instance alone (checked before downloading anything)
+if is_nvbroadcast_running && [ "${FORCE_UPDATE:-false}" != "true" ]; then
+    echo -e "  ${YELLOW}[SKIP] NV Broadcast is running; update ($current_ver -> $latest_ver) is available (use --force to update).${RESET}"
+    return 0
 fi
 
 if [ "${DRY_RUN:-false}" = "true" ]; then
-    log_info "[DRY-RUN] Would update NV Broadcast (${current_ver:-none} -> $latest_ver)..."
-    [ "$was_running" = "true" ] && restart_app "NV Broadcast" "com.doczeus.NVBroadcast" "nvbroadcast" is_nvbroadcast_running
+    log_info "[DRY-RUN] Would download NV Broadcast ${latest_ver}, then stop/install/restart it (${current_ver:-none} -> $latest_ver)..."
     return 0
 fi
 
@@ -70,28 +63,17 @@ if [ -z "$rpm_url" ]; then
 fi
 
 log_info "Updating NV Broadcast (${current_ver:-none} -> $latest_ver)..."
-log_action "Downloading NV Broadcast RPM..."
+log_action "Downloading NV Broadcast RPM (NV Broadcast keeps running)..."
 local tmp_dir; tmp_dir="$(mktemp -d -t "nvbroadcast-update-XXXXXX")"
 local rpm_file="$tmp_dir/nvbroadcast-${latest_ver}.rpm"
 
-if ! curl -# -fSL -o "$rpm_file" "$rpm_url" 2>/dev/null; then
+if ! fast_download "$rpm_url" "$rpm_file"; then
     log_warn "Failed to download NV Broadcast RPM from $rpm_url; continuing..."
     rm -rf "$tmp_dir"
-    [ "$was_running" = "true" ] && restart_app "NV Broadcast" "com.doczeus.NVBroadcast" "nvbroadcast" is_nvbroadcast_running
     return 1
 fi
 
-log_action "Installing verified NV Broadcast RPM package..."
-if with_rpm_lock sudo dnf install --assumeyes "$rpm_file" >> "$LOG_FILE" 2>&1; then
-    log_ok "NV Broadcast updated to $latest_ver."
-else
-    log_warn "DNF install encountered issues; attempting fallback rpm upgrade..."
-    with_rpm_lock sudo rpm -Uvh --replacepkgs "$rpm_file" >> "$LOG_FILE" 2>&1 || log_warn "RPM upgrade had issues, continuing..."
-fi
+swap_rpm_app "NV Broadcast" "$rpm_file" get_nvbroadcast_pids is_nvbroadcast_running \
+    "com.doczeus.NVBroadcast" "nvbroadcast" _clean_nvbroadcast_local_overrides \
+    && log_ok "NV Broadcast updated to $latest_ver."
 rm -rf "$tmp_dir"
-
-_clean_nvbroadcast_local_overrides
-
-if [ "$was_running" = "true" ]; then
-    restart_app "NV Broadcast" "com.doczeus.NVBroadcast" "nvbroadcast" is_nvbroadcast_running
-fi

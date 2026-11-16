@@ -33,21 +33,14 @@ if [ -n "$current_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
     return 0
 fi
 
-local was_running=false
-if is_rustdesk_session_running; then
-    if [ "${FORCE_UPDATE:-false}" != "true" ]; then
-        echo -e "  ${YELLOW}[SKIP] RustDesk has an active window or session; update ($current_ver -> $latest_ver) is available (use --force to update).${RESET}"
-        return 0
-    elif ! safe_stop_app "RustDesk" get_rustdesk_session_pids is_rustdesk_session_running; then
-        return 1
-    else
-        was_running=true
-    fi
+# Not forced: leave a running session alone (checked before downloading anything)
+if is_rustdesk_session_running && [ "${FORCE_UPDATE:-false}" != "true" ]; then
+    echo -e "  ${YELLOW}[SKIP] RustDesk has an active window or session; update ($current_ver -> $latest_ver) is available (use --force to update).${RESET}"
+    return 0
 fi
 
 if [ "${DRY_RUN:-false}" = "true" ]; then
-    log_info "[DRY-RUN] Would update RustDesk (${current_ver:-none} -> $latest_ver)..."
-    [ "$was_running" = "true" ] && restart_app "RustDesk" "rustdesk" "rustdesk" is_rustdesk_session_running
+    log_info "[DRY-RUN] Would download RustDesk ${latest_ver}, then stop/install/restart it (${current_ver:-none} -> $latest_ver)..."
     return 0
 fi
 
@@ -73,28 +66,17 @@ if [ -z "$rpm_url" ]; then
 fi
 
 log_info "Updating RustDesk (${current_ver:-none} -> $latest_ver)..."
-log_action "Downloading RustDesk RPM..."
+log_action "Downloading RustDesk RPM (RustDesk keeps running)..."
 local tmp_dir; tmp_dir="$(mktemp -d -t "rustdesk-update-XXXXXX")"
 local rpm_file="$tmp_dir/rustdesk-${latest_ver}.${rpm_arch}.rpm"
 
-if ! curl -# -fSL -o "$rpm_file" "$rpm_url" 2>/dev/null; then
+if ! fast_download "$rpm_url" "$rpm_file"; then
     log_warn "Failed to download RustDesk RPM from $rpm_url; continuing..."
     rm -rf "$tmp_dir"
-    [ "$was_running" = "true" ] && restart_app "RustDesk" "rustdesk" "rustdesk" is_rustdesk_session_running
     return 1
 fi
 
-log_action "Installing verified RustDesk RPM package..."
-if with_rpm_lock sudo dnf install --assumeyes "$rpm_file" >> "$LOG_FILE" 2>&1; then
-    log_ok "RustDesk updated to $latest_ver."
-else
-    log_warn "DNF install encountered issues; attempting fallback rpm upgrade..."
-    with_rpm_lock sudo rpm -Uvh --replacepkgs "$rpm_file" >> "$LOG_FILE" 2>&1 \
-        && log_ok "RustDesk updated to $latest_ver." \
-        || log_warn "RPM upgrade had issues, continuing..."
-fi
+swap_rpm_app "RustDesk" "$rpm_file" get_rustdesk_session_pids is_rustdesk_session_running \
+    "rustdesk" "rustdesk" \
+    && log_ok "RustDesk updated to $latest_ver."
 rm -rf "$tmp_dir"
-
-if [ "$was_running" = "true" ]; then
-    restart_app "RustDesk" "rustdesk" "rustdesk" is_rustdesk_session_running
-fi

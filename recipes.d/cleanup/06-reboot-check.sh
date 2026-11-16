@@ -2,7 +2,13 @@
 step "System: Checking for required reboots & service restarts"
 
 if command -v dnf &>/dev/null; then
-    if with_rpm_lock sudo dnf needs-restarting -q -r >/dev/null 2>&1; then
+    # -r (reboot) and -s (services) are independent; run them concurrently
+    local svc_file; svc_file="$(mktemp -t update-svc-XXXXXX)"
+    sudo dnf needs-restarting -q -s > "$svc_file" 2>/dev/null &
+    local svc_pid=$!
+    REBOOT_CHECK_RC=0
+    sudo dnf needs-restarting -q -r >/dev/null 2>&1 || REBOOT_CHECK_RC=$?
+    if [ "$REBOOT_CHECK_RC" -eq 0 ]; then
         log_ok "No reboot required."
     else
         echo -e "\n${BOLD}${RED}╔══════════════════════════════════════════════════════════╗${RESET}"
@@ -14,7 +20,9 @@ if command -v dnf &>/dev/null; then
             echo -e "  Run: ${BOLD}systemctl reboot${RESET}  (or re-run with ${BOLD}--restart${RESET})"
         fi
     fi
-    local restart_services; restart_services="$(with_rpm_lock sudo dnf needs-restarting -q -s 2>/dev/null || true)"
+    wait "$svc_pid" 2>/dev/null || true
+    local restart_services; restart_services="$(cat "$svc_file" 2>/dev/null || true)"
+    rm -f "$svc_file"
     if [ -n "$restart_services" ]; then
         log_info "Services requiring restart:"
         echo "$restart_services" | sed 's/^/      /'

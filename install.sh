@@ -16,7 +16,7 @@ echo -e "\033[1;36m========================================\033[0m\n"
 
 # 1. Make scripts executable
 chmod +x "$SCRIPT_DIR/update" "$SCRIPT_DIR/update-all" "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/test" "$SCRIPT_DIR/helpers"/*.py 2>/dev/null || true
-chmod +x "$SCRIPT_DIR/recipes.d"/*/*.sh 2>/dev/null || true
+chmod +x "$SCRIPT_DIR/recipes.d"/*/*.sh "$SCRIPT_DIR/lib"/*.sh 2>/dev/null || true
 echo -e "\033[0;32m[OK] Scripts marked executable.\033[0m"
 
 # 2. Create symlinks in ~/.local/bin

@@ -52,6 +52,8 @@ fedora-update/
 ├── update-all             # 4-line wrapper: exec update --trim "$@"
 ├── install.sh             # Bootstrap symlinks, permissions & Syncthing
 ├── test                   # Automated verification gate (bash -n, py_compile, dry-run)
+├── lib/                   # Shared bash helpers sourced by `update` (bash -n checked first)
+│   └── rpm-app.sh         # swap_rpm_app: minimal-downtime RPM install for running GUI apps
 ├── helpers/               # Standalone polyglot scripts
 │   ├── android_canary.py  # Android Studio Canary metadata resolver
 │   ├── asar_icon.py       # Electron asar icon extractor
@@ -130,7 +132,10 @@ fedora-update/
 ### Rule 1: Active Agent & App Protection (Zero Interruption by Default; Safe Restart with `--force`)
 - Before modifying or updating an AI agent, IDE, or editor (Antigravity IDE/Desktop, Agy, Claude, Herdr, Android Studio, VS Code), verify whether its process is active via `is_*_running`.
 - **Default (Zero Interruption):** If the process is active, skip the update to protect the user's active session.
-- **Force Mode (`--force` / `-f`):** When `--force` is specified, `fedora-update` checks if an update is available first. If an update is required, it gracefully terminates the application (SIGTERM with clean shutdown wait and SIGKILL fallback), applies the update, and automatically relaunches the application (`gtk-launch` or background daemon).
+- **Force Mode (`--force` / `-f`):** When `--force` is specified, `fedora-update` checks if an update is available first. If an update is required, it **downloads/builds/extracts the new version while the app keeps running**, then gracefully terminates the application (SIGTERM with clean shutdown wait and SIGKILL fallback) only for the final swap, and automatically relaunches it (`gtk-launch` or background daemon).
+  - **Tarball apps (`sync_tar_app`)** stage the new build in `<parent>/.<name>.staging` (same filesystem), so the swap is an instant `mv`; the old build is renamed to `.<name>.old` and deleted after relaunch (restored on failure).
+  - **RPM apps (`swap_rpm_app` in `lib/rpm-app.sh`)** wait for the RPM lock (e.g. a concurrent `dnf upgrade`) *before* closing the app, hold it via `rpm_lock_acquire` across stop → `rpm -U` (dnf fallback) → post-install hook, and call `rpm_lock_release` **before** relaunching (a relaunched child would otherwise inherit the lock fd).
+  - **VS Code** extensions are updated in place with `code --update-extensions`; VS Code is never closed.
 - **Targeted App Force-Update (`--app` / `-a [APP]` and `--force=APPS`):**
   - `update --app` (or `update -a`) launches an interactive terminal selector (`fzf` multi-select with numbered fallback) showing live `[RUNNING]` / `[idle]` badges at the top of the list, then force-updates only the chosen recipe(s).
   - `update --app <name>` (e.g. `update -a rustdesk`) immediately force-updates only the specified recipe(s) without touching other running apps.
@@ -138,7 +143,7 @@ fedora-update/
 - **Ancestor Protection:** The script verifies whether any running target process is an ancestor of the running shell (`$$`). If spawned inside an IDE terminal, shutdown is bypassed to prevent killing its own parent session.
 
 ### Rule 1b: Auto-Restart (`--restart` / `-r`)
-- Opt-in only; also implies `--firmware`. After the execution summary, `maybe_auto_restart` re-runs `dnf needs-restarting -r`; exit code `1` (reboot required) or a staged fwupd firmware update (`firmware_reboot_pending`) triggers a reboot.
+- Opt-in only; also implies `--force` and `--firmware` (`update -r` == `update -f -r`; an explicit `--force=APPS` still narrows force-restarts to those apps). After the execution summary, `maybe_auto_restart` reuses `REBOOT_CHECK_RC` from `cleanup/06-reboot-check.sh` (or re-runs `dnf needs-restarting -r` if cleanup was skipped); exit code `1` (reboot required) or a staged fwupd firmware update (`firmware_reboot_pending`) triggers a reboot.
 - DNF failures (e.g. a repo with a rotated GPG signing key) are surfaced in red by `recipes.d/dnf/01-upgrade.sh`; one bad repo package aborts the whole transaction.
 - A 30-second countdown (override with `UPDATE_RESTART_DELAY`) lets the user cancel with any key. `--dry-run` only reports what would happen.
 
@@ -179,13 +184,24 @@ When provisioning a fresh Fedora machine before Syncthing is running:
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 4.1.0 (Concurrent Wave Orchestrator, RPM Mutex & Claude Desktop Official RPM)
+- **Current Version:** 4.2.0 (Single Concurrent Wave, Download-Before-Stop App Swaps, `-r` implies `-f`)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
 ---
 
 ## 7. Changelog
+
+### v4.2.0 (2026-11-16)
+
+**Scheduling: Single Concurrent Wave & Minimal App Downtime**
+- **Run order** is now `run_core_bootstrap` (core 01-05 sequential, main shell) → one `run_parallel_modules` wave of `core | dnf | flatpak | snap | firmware | ai | dev | git | self` → `cleanup`. AI/dev/git no longer wait for a multi-minute `dnf upgrade`. Critical path ≈ bootstrap + slowest module + cleanup (previously core + slowest of wave 1 + slowest of wave 2 + cleanup).
+- `_module_active_recipes` is the single source of truth for which recipes a module runs (used by counting and execution), so step numbers stay `1..N` with the bootstrap split.
+- **Download-before-stop:** `sync_tar_app` (Android Studio, Antigravity Desktop/IDE) and the RPM apps (RustDesk, OpenLogi, NV Broadcast, Claude Desktop) fetch/build/stage while the app is running; the app is closed only for the swap.
+- **RPM lock:** `rpm_lock_acquire`/`rpm_lock_release` hold the lock across multi-command sections; `with_rpm_lock` is a passthrough while held. Timeout raised to 1800s (`UPDATE_RPM_LOCK_TIMEOUT`).
+- **`--restart` / `-r` implies `--force`.**
+- `cleanup/06-reboot-check.sh` runs `needs-restarting -r` and `-s` concurrently and exports `REBOOT_CHECK_RC` for `maybe_auto_restart`.
+- `./test` also checks `lib/*.sh` syntax, `-r` ⇒ force mode, and in-order step numbering across the wave.
 
 ### v4.1.0 (2026-10-22)
 

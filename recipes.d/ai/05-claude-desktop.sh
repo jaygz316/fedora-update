@@ -48,21 +48,14 @@ if [ -n "$current_ver" ] && [ "$current_ver" = "$latest_ver" ]; then
     return 0
 fi
 
-local was_running=false
-if is_claude_desktop_running; then
-    if [ "${FORCE_UPDATE:-false}" != "true" ]; then
-        echo -e "  ${YELLOW}[SKIP] Claude Desktop is running; update (${current_ver:-none} -> $latest_ver) is available (use --force to update).${RESET}"
-        return 0
-    elif ! safe_stop_app "Claude Desktop" get_claude_desktop_pids is_claude_desktop_running; then
-        return 1
-    else
-        was_running=true
-    fi
+# Not forced: leave a running app alone (checked before downloading/building anything)
+if is_claude_desktop_running && [ "${FORCE_UPDATE:-false}" != "true" ]; then
+    echo -e "  ${YELLOW}[SKIP] Claude Desktop is running; update (${current_ver:-none} -> $latest_ver) is available (use --force to update).${RESET}"
+    return 0
 fi
 
 if [ "${DRY_RUN:-false}" = "true" ]; then
-    log_info "[DRY-RUN] Would build and update Claude Desktop (${current_ver:-none} -> $latest_ver)..."
-    [ "$was_running" = "true" ] && restart_app "Claude Desktop" "com.anthropic.Claude" "claude-desktop" is_claude_desktop_running
+    log_info "[DRY-RUN] Would build Claude Desktop ${latest_ver} RPM, then stop/install/restart it (${current_ver:-none} -> $latest_ver)..."
     return 0
 fi
 
@@ -76,7 +69,7 @@ for req_cmd in rpmbuild ar file xz gpg; do
 done
 
 log_info "Updating Claude Desktop (${current_ver:-none} -> $latest_ver)..."
-log_action "Downloading & repackaging official .deb into Fedora RPM..."
+log_action "Downloading & repackaging official .deb into Fedora RPM (Claude Desktop keeps running)..."
 local tmp_dir; tmp_dir="$(mktemp -d -p /var/tmp -t "claude-desktop-update-XXXXXX")"
 local build_ok=false
 
@@ -91,30 +84,17 @@ if [ "$build_ok" != "true" ]; then
     TMPDIR="/var/tmp" "$builder_script" --outdir "$tmp_dir" --expect-sha256 "$latest_sha256" >> "$LOG_FILE" 2>&1 && build_ok=true
 fi
 
-if [ "$build_ok" = "true" ]; then
-    local rpm_file=""
-    rpm_file="$(find "$tmp_dir" -maxdepth 1 -type f -name 'claude-desktop-*.rpm' -print -quit)"
-    if [ -n "$rpm_file" ] && [ -f "$rpm_file" ]; then
-        log_action "Installing verified Claude Desktop RPM package..."
-        if [ -n "$current_ver" ] && with_rpm_lock sudo rpm -Uvh --replacepkgs "$rpm_file" >> "$LOG_FILE" 2>&1; then
-            log_ok "Claude Desktop updated to $latest_ver."
-        elif with_rpm_lock sudo dnf install --assumeyes "$rpm_file" >> "$LOG_FILE" 2>&1; then
-            log_ok "Claude Desktop updated to $latest_ver."
-        else
-            log_warn "DNF install encountered issues; attempting fallback rpm upgrade..."
-            with_rpm_lock sudo rpm -Uvh --replacepkgs "$rpm_file" >> "$LOG_FILE" 2>&1 \
-                && log_ok "Claude Desktop updated to $latest_ver." \
-                || log_warn "RPM upgrade had issues, continuing..."
-        fi
-    else
-        log_warn "Claude Desktop build completed but no RPM file was found."
-    fi
-else
+local rpm_file=""
+[ "$build_ok" = "true" ] && rpm_file="$(find "$tmp_dir" -maxdepth 1 -type f -name 'claude-desktop-*.rpm' -print -quit)"
+
+if [ "$build_ok" != "true" ]; then
     log_warn "Failed to build Claude Desktop RPM from upstream .deb; check $LOG_FILE."
+elif [ -z "$rpm_file" ] || [ ! -f "$rpm_file" ]; then
+    log_warn "Claude Desktop build completed but no RPM file was found."
+else
+    swap_rpm_app "Claude Desktop" "$rpm_file" get_claude_desktop_pids is_claude_desktop_running \
+        "com.anthropic.Claude" "claude-desktop" \
+        && log_ok "Claude Desktop updated to $latest_ver."
 fi
 
 rm -rf "$tmp_dir"
-
-if [ "$was_running" = "true" ]; then
-    restart_app "Claude Desktop" "com.anthropic.Claude" "claude-desktop" is_claude_desktop_running
-fi

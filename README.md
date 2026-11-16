@@ -35,10 +35,10 @@ update-all          # Same + SSD TRIM (fstrim -av)
 ```bash
 update --app, -a                   # Interactive terminal menu to force-update specific app(s)
 update --app rustdesk              # Immediately force-update only RustDesk (or comma-separated list)
-update --force, -f                 # Safely close all running apps for updates, then restart them
+update --force, -f                 # Update running apps too: each downloads while still open, then is closed only for the swap and relaunched
 update --force=rustdesk,vscode     # Full update run, but only force-restart specified app(s)
 update --dry-run, -n               # Preview all steps, no system changes
-update --restart, -r               # Reboot automatically at the end if a reboot is required (implies --firmware)
+update --restart, -r               # Reboot automatically at the end if a reboot is required (implies --force --firmware)
 update --firmware                  # Install LVFS firmware updates (BIOS, UEFI dbx) instead of only checking
 update --only=core                 # Run only one section
 update --skip=dnf,flatpak          # Skip sections (comma-separated)
