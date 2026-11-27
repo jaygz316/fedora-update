@@ -173,6 +173,24 @@ init_logging() {
 }
 
 ###############################################################################
+# TTY GUARD — a tool in a parallel job can leave the terminal in raw mode
+# (-opost -icanon -echo), turning piped progress output into a staircase.
+# Snapshot the terminal settings at startup and put them back whenever they drift.
+###############################################################################
+_TTY_STATE=""
+tty_snapshot() {
+    [ -t 0 ] && _TTY_STATE="$(stty -g 2>/dev/null)" || true
+}
+tty_restore() {
+    [ -n "$_TTY_STATE" ] || return 0
+    { [ "$(stty -g 2>/dev/null)" = "$_TTY_STATE" ] || stty "$_TTY_STATE" 2>/dev/null; } </dev/tty 2>/dev/null || true
+}
+_on_exit() {
+    tty_restore
+    [ -n "${_SUDO_KEEPALIVE_PID:-}" ] && kill -9 "$_SUDO_KEEPALIVE_PID" $(pgrep -P "$_SUDO_KEEPALIVE_PID" 2>/dev/null || true) 2>/dev/null || true
+}
+
+###############################################################################
 # PASSWORDLESS SUDO & POLKIT AUTO-SETUP
 ###############################################################################
 ensure_passwordless_sudo() {
@@ -219,7 +237,6 @@ EOF
     if sudo -n true 2>/dev/null; then
         while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done </dev/null >/dev/null 2>&1 &
         _SUDO_KEEPALIVE_PID=$!
-        trap '[ -n "$_SUDO_KEEPALIVE_PID" ] && kill -9 "$_SUDO_KEEPALIVE_PID" $(pgrep -P "$_SUDO_KEEPALIVE_PID" 2>/dev/null || true) 2>/dev/null || true' EXIT
     fi
 }
 
@@ -1058,12 +1075,13 @@ _run_single_recipe() {
     source "$recipe"
     rpm_lock_release   # safety net if a recipe returned early while holding the lock
     FORCE_UPDATE="$_prev_force"
+    tty_restore        # a recipe tool may have left the terminal in raw mode
 }
 
 # Stream a background job's buffered terminal output to fd 3 live, until the job and its tee finish
 _stream_job_output() {
     local term="$1" done_file="$2" pid="$3"
-    local off=0 size finished=0 grace=0
+    local off=0 size finished=0 grace=0 tick=0
     while :; do
         if [ -e "$done_file" ]; then
             finished=1
@@ -1077,9 +1095,11 @@ _stream_job_output() {
             tail -c +"$((off + 1))" "$term" | head -c "$((size - off))" >&3
             off="$size"
         fi
+        tick=$((tick + 1)); [ $((tick % 4)) -eq 0 ] && tty_restore
         [ "$finished" -eq 1 ] && break
         sleep 0.25
     done
+    tty_restore
     wait "$pid" 2>/dev/null || true
 }
 
@@ -1111,6 +1131,7 @@ _run_parallel_recipe_batch() {
             STEP_COUNT=$((assigned_step - 1))
             LOG_FILE="$full_log"
             RECIPE_LOG_FILE="$full_log"
+            exec </dev/null   # keep parallel tools off the shared tty (they may switch it to raw mode)
             exec > >(tee -a "$full_log" >> "$term_log"; : > "$done_file") 2>&1
             _run_single_recipe "$r"
         ) &
@@ -1217,6 +1238,7 @@ run_parallel_modules() {
             LOG_FILE="$full_log"
             RECIPE_LOG_FILE="$full_log"
             exec 3>>"$term_log"
+            exec </dev/null   # keep parallel tools off the shared tty (they may switch it to raw mode)
             exec > >(tee -a "$full_log" >> "$term_log"; : > "$done_file") 2>&1
             local mt0 mt1
             mt0=$(date +%s)
@@ -1360,6 +1382,8 @@ maybe_auto_restart() {
 # MAIN
 ###############################################################################
 main() {
+    tty_snapshot
+    trap _on_exit EXIT
     [ "${#APP_QUERIES[@]}" -gt 0 ] && resolve_app_queries
     [ "$APP_MENU" = "true" ] && select_apps_interactively
 

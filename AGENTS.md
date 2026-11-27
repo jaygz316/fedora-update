@@ -184,13 +184,20 @@ When provisioning a fresh Fedora machine before Syncthing is running:
 ## 6. Repository Metadata
 
 - **Maintainer:** Jay & Agentic Fleet
-- **Current Version:** 4.2.0 (Single Concurrent Wave, Download-Before-Stop App Swaps, `-r` implies `-f`)
+- **Current Version:** 4.2.1 (TTY raw-mode guard for the concurrent wave)
 - **Primary Branch:** `main`
 - **Supported Architectures:** `x86_64`, `aarch64`
 
 ---
 
 ## 7. Changelog
+
+### v4.2.1 (2026-11-27)
+
+**Fix: terminal left in raw mode during the concurrent wave**
+- A tool in a parallel job could switch the shared tty to raw mode (`-opost -icanon -echo`), so piped progress output (e.g. `flatpak update`) drew as a staircase.
+- `main` snapshots tty settings (`tty_snapshot`, `stty -g`); `tty_restore` puts them back after every recipe, once a second while streaming job output, after each job, and on exit (`_on_exit`, which also stops the sudo keepalive).
+- Parallel batch/wave subshells now run with `exec </dev/null` so their tools cannot change tty modes through stdin.
 
 ### v4.2.0 (2026-11-16)
 
